@@ -1,4 +1,5 @@
 # Island
+<img width="1919" height="1079" alt="image" src="https://github.com/user-attachments/assets/8631a306-d3c8-4811-a408-1d84b7ecdde0" />
 
 Требуется Windows 10 x64
 
