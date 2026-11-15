@@ -8,9 +8,10 @@ permissions:
   contents: write
 concurrency:
   group: windows-release
-  cancel-in-progress: false
+  cancel-in-progress: true
 jobs:
   release:
+    if: ${{ false }} # Publishing held while investigating wallpaper regression
     runs-on: windows-2022
     timeout-minutes: 40
     defaults:
