@@ -463,6 +463,7 @@ void Desktop::Impl::View::pulse(bool force){
     if(resumed){lastFrame=stamp;lastDraw=0;}
     if(awaitingLocalWallpaper){auto local=parent->media.snapshot();if(!local.loading){awaitingLocalWallpaper=false;localWallpaperError=!local.error.empty();if(local.image&&!localWallpaperError)engineWallpaper.disable();}}
     engineWallpaper.setActive(visible&&data.performance.video);if(!visible||!data.performance.video)RemovePropW(hwnd,L"OwnIsland.EngineSource");engineState=engineWallpaper.snapshot();
+    SetPropW(hwnd,L"OwnIsland.EngineAnchor",backdrop);SetPropW(hwnd,L"OwnIsland.EngineRetained",engineState.window);SetPropW(hwnd,L"OwnIsland.EngineLoading",(HANDLE)(UINT_PTR)engineState.loading);
     if(engineState.window!=lastEngineWindow){lastEngineWindow=engineState.window;if(lastEngineWindow)SetWindowPos(hwnd,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_NOOWNERZORDER);}
     imageMedia.setActive(visible&&page==0&&layout[Image].shown&&data.performance.video,data.performance.desktopFPS);if(!visible){if(timerInterval!=250){timerInterval=250;SetTimer(hwnd,1,timerInterval,nullptr);}editors(false);return;}
     bool animating=animation&&stamp-animation<620;

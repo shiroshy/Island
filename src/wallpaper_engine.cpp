@@ -119,6 +119,7 @@ struct EngineWallpaper::Impl {
     void save(){auto ini=stateDirectory()+L"\\settings.ini";WritePrivateProfileStringW(section.c_str(),L"wallpaper-engine",state.enabled?L"1":L"0",ini.c_str());WritePrivateProfileStringW(section.c_str(),L"wallpaper-engine-follow",follow?L"1":L"0",ini.c_str());WritePrivateProfileStringW(section.c_str(),L"wallpaper-engine-file",file.c_str(),ini.c_str());WritePrivateProfileStringW(L"wallpaper-engine",L"executable",executable.c_str(),ini.c_str());}
     void run(){
         CoInitializeEx(nullptr,COINIT_MULTITHREADED);std::wstring ownedExe,ownedTitle;HWND source=nullptr;HANDLE owner=nullptr,watch=nullptr;uint64_t applied=~0ull;int attempts=0;ULONGLONG retry=0,poll=0;
+        auto phase=[&](UINT n){if(IsWindow(anchor))SetPropW(anchor,L"OwnIsland.EnginePhase",(HANDLE)(UINT_PTR)n);};phase(0);
         auto close=[&]{if(!ownedTitle.empty()){
                 engineCommand(ownedExe,L"-control closeWallpaper -location "+engineQuote(ownedTitle));
                 DWORD pid=0;wchar_t name[512]={};if(source){GetWindowThreadProcessId(source,&pid);GetWindowTextW(source,name,512);}
@@ -128,13 +129,14 @@ struct EngineWallpaper::Impl {
         for(;;){std::wstring exe,path;bool use=false,enabled=false,lookup=false,sync=false;uint64_t generation;
             {std::unique_lock lock(mutex);wake.wait_for(lock,std::chrono::milliseconds(100));if(stopping)break;exe=executable;path=file;generation=revision;enabled=state.enabled;use=active&&enabled;lookup=current;current=false;sync=follow&&use&&GetTickCount64()>=poll;}
             if(generation!=applied||!enabled){close();std::lock_guard lock(mutex);state.window=nullptr;state.loading=use;applied=generation;attempts=0;retry=0;}
-            DWORD actualPid=0;wchar_t actualTitle[512]={};if(source){GetWindowThreadProcessId(source,&actualPid);GetWindowTextW(source,actualTitle,512);}
-            if(source&&(!IsWindow(source)||!owner||actualPid!=GetProcessId(owner)||WaitForSingleObject(owner,0)!=WAIT_TIMEOUT||ownedTitle!=actualTitle||GetParent(source)!=anchor)){close();std::lock_guard lock(mutex);state.window=nullptr;}
-            if(source&&(IsIconic(source)!=FALSE)==use){
-                // Preserve this window's decoder/composition resources. Minimization
-                // gives its renderer the native SIZE_MINIMIZED state, without a
-                // global pause command affecting wallpapers on other monitors.
-                ShowWindowAsync(source,use?SW_SHOWNOACTIVATE:SW_SHOWMINNOACTIVE);
+            DWORD actualPid=0;if(source)GetWindowThreadProcessId(source,&actualPid);
+            if(source&&(!IsWindow(source)||!owner||actualPid!=GetProcessId(owner)||WaitForSingleObject(owner,0)!=WAIT_TIMEOUT)){close();std::lock_guard lock(mutex);state.window=nullptr;}
+            if(source&&(((GetWindowLongPtrW(source,GWL_STYLE)&WS_VISIBLE)!=0)!=use)){
+                // Hide only our child while covered. Keep its normal geometry and
+                // avoid minimizing a foreign renderer attached to our UI queue.
+                // The native show/hide notification is scoped to this window.
+                ShowWindowAsync(source,use?SW_SHOWNA:SW_HIDE);
+                phase(use?8:7);
             }
             if(!use&&!lookup)continue;
             if(!engineExecutable(exe)){std::lock_guard lock(mutex);state.loading=false;state.error=L"Не найден Wallpaper Engine";continue;}
@@ -151,16 +153,18 @@ struct EngineWallpaper::Impl {
             if(!engineProject(path)){std::lock_guard lock(mutex);state.loading=false;state.error=L"Файл обоев недоступен";continue;}
             if(!engineRunning(exe)){launchEngine(exe);for(int i=0;i<20;i++){std::unique_lock lock(mutex);if(stopping||revision!=generation||!active)break;wake.wait_for(lock,std::chrono::milliseconds(100));if(engineRunning(exe))break;}}
             ownedExe=exe;ownedTitle=title;auto args=L"-control openWallpaper -file "+engineQuote(path)+L" -playInWindow "+engineQuote(title)+L" -width "+std::to_wstring(monitor.right-monitor.left)+L" -height "+std::to_wstring(monitor.bottom-monitor.top)+L" -x -30000 -y -30000 -borderless true -activate false";
-            engineCommand(exe,args);
+            phase(1);engineCommand(exe,args);phase(2);
             for(int i=0;i<60;i++){source=engineWindow(exe,title);if(source)break;std::unique_lock lock(mutex);if(stopping||revision!=generation||!active)break;wake.wait_for(lock,std::chrono::milliseconds(100));}
-            if(source){DWORD pid=0;GetWindowThreadProcessId(source,&pid);owner=OpenProcess(SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid);watch=owner?engineWatch(source,owner,title,exe):nullptr;if(!watch){close();}else{
+            if(source){DWORD pid=0;GetWindowThreadProcessId(source,&pid);owner=OpenProcess(SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid);phase(3);watch=owner?engineWatch(source,owner,title,exe):nullptr;if(!watch){close();}else{
                 // Only our uniquely named pop-out is embedded. Its host is Island's opaque
                 // per-monitor backdrop, never an existing Wallpaper Engine desktop window.
                 auto style=GetWindowLongPtrW(source,GWL_STYLE);SetWindowLongPtrW(source,GWL_STYLE,(style|WS_CHILD|WS_CLIPSIBLINGS)&~(WS_POPUP|WS_CAPTION|WS_THICKFRAME));
                 auto extended=GetWindowLongPtrW(source,GWL_EXSTYLE);SetWindowLongPtrW(source,GWL_EXSTYLE,(extended|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW)&~WS_EX_APPWINDOW);
-                SetParent(source,anchor);if(GetParent(source)!=anchor){close();}else{RECT bounds{};GetClientRect(anchor,&bounds);SetWindowPos(source,HWND_TOP,0,0,bounds.right,bounds.bottom,SWP_NOACTIVATE|SWP_FRAMECHANGED|SWP_SHOWWINDOW);}
+                phase(4);SetParent(source,anchor);if(GetParent(source)!=anchor){close();}else{RECT bounds{};GetClientRect(anchor,&bounds);phase(5);SetWindowPos(source,HWND_TOP,0,0,bounds.right,bounds.bottom,SWP_NOACTIVATE|SWP_FRAMECHANGED|SWP_SHOWWINDOW);}
             }}
-            {std::lock_guard lock(mutex);if(generation==revision&&active&&state.enabled){state.window=source;state.loading=false;state.error=source?L"":L"Wallpaper Engine не открыл обои";}}
+            // A completed retained source must be published even if occlusion
+            // changed active while the native window was being attached.
+            {std::lock_guard lock(mutex);if(generation==revision&&state.enabled){state.window=source;state.loading=false;state.error=source?L"":L"Wallpaper Engine не открыл обои";}}phase(source?6:9);
         }
         close();CoUninitialize();
     }
