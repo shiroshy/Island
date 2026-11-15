@@ -9,6 +9,7 @@
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
+#include <d3d10.h>
 #include <filesystem>
 #include <fstream>
 #include <atomic>
@@ -38,38 +39,54 @@ std::wstring mediaText(const std::wstring& path){std::ifstream f(std::filesystem
 bool mediaWrite(const std::wstring& path,const std::wstring& s){int n=WideCharToMultiByte(CP_UTF8,0,s.data(),(int)s.size(),nullptr,0,nullptr,nullptr);std::string b(n,0);if(n)WideCharToMultiByte(CP_UTF8,0,s.data(),(int)s.size(),b.data(),n,nullptr,nullptr);std::ofstream f(std::filesystem::path(path),std::ios::binary);f.write(b.data(),b.size());return f.good();}
 bool videoPath(const std::wstring& p){auto e=std::filesystem::path(p).extension().wstring();for(auto& c:e)c=towlower(c);return e==L".mp4"||e==L".m4v"||e==L".mov"||e==L".wmv"||e==L".avi";}
 struct VideoFrames {
-    Com<IMFSourceReader> reader;UINT32 width=0,height=0;LONG stride=0;LONGLONG timestamp=0;
-    bool open(const std::wstring& path){
-        reader.reset();Com<IMFAttributes> a;MFCreateAttributes(a.put(),2);a->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,TRUE);
-        if(FAILED(MFCreateSourceReaderFromURL(path.c_str(),a.p,reader.put())))return false;
+    Com<ID3D11Device> device;Com<IMFDXGIDeviceManager> manager;
+    Com<IMFSourceReader> reader;Com<IMFSample> sample;UINT32 width=0,height=0;LONG stride=0;LONGLONG timestamp=0,duration=333333;
+    bool open(const std::wstring& path,bool advanced=true,bool gpu=true){
+        reader.reset();sample.reset();manager.reset();device.reset();Com<IMFAttributes> a;if(FAILED(MFCreateAttributes(a.put(),3)))return false;
+        // The legacy converter is intended for thumbnails, not continuous playback.
+        a->SetUINT32(advanced?MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING:MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,TRUE);
+        if(advanced)a->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,TRUE);
+        if(advanced&&gpu){
+            UINT token=0;D3D_FEATURE_LEVEL level;Com<ID3D10Multithread> multithread;
+            if(SUCCEEDED(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,D3D11_CREATE_DEVICE_BGRA_SUPPORT|D3D11_CREATE_DEVICE_VIDEO_SUPPORT,nullptr,0,D3D11_SDK_VERSION,device.put(),&level,nullptr))&&
+                SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(multithread.put())))&&SUCCEEDED(MFCreateDXGIDeviceManager(&token,manager.put()))&&SUCCEEDED(manager->ResetDevice(device.p,token))){
+                multithread->SetMultithreadProtected(TRUE);a->SetUnknown(MF_SOURCE_READER_D3D_MANAGER,manager.p);
+            }else{manager.reset();device.reset();}
+        }
+        auto fallback=[&]{return advanced?(gpu?open(path,true,false):open(path,false,false)):false;};
+        if(FAILED(MFCreateSourceReaderFromURL(path.c_str(),a.p,reader.put())))return fallback();
         reader->SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS,FALSE);reader->SetStreamSelection(MF_SOURCE_READER_FIRST_VIDEO_STREAM,TRUE);
         Com<IMFMediaType> type;MFCreateMediaType(type.put());type->SetGUID(MF_MT_MAJOR_TYPE,MFMediaType_Video);type->SetGUID(MF_MT_SUBTYPE,MFVideoFormat_RGB32);
-        if(FAILED(reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,nullptr,type.p)))return false;
+        if(FAILED(reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,nullptr,type.p)))return fallback();
         reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,type.put());MFGetAttributeSize(type.p,MF_MT_FRAME_SIZE,&width,&height);
         if(!width||!height||width>4096||height>4096)return false;
         UINT32 s=0;stride=SUCCEEDED(type->GetUINT32(MF_MT_DEFAULT_STRIDE,&s))?(LONG)s:(LONG)width*4;return true;
     }
-    std::shared_ptr<const PixelImage> next(bool& ended){
-        ended=false;Com<IMFSample> sample;DWORD flags=0;
+    bool read(bool& ended){
+        ended=false;sample.reset();DWORD flags=0;
         for(int attempts=0;attempts<12;attempts++){
             if(FAILED(reader->ReadSample(MF_SOURCE_READER_FIRST_VIDEO_STREAM,0,nullptr,&flags,&timestamp,sample.put())))return {};
             if(flags&MF_SOURCE_READERF_ENDOFSTREAM){ended=true;return {};}
             if(flags&MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED){Com<IMFMediaType> type;if(FAILED(reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,type.put()))||FAILED(MFGetAttributeSize(type.p,MF_MT_FRAME_SIZE,&width,&height))||!width||!height||width>4096||height>4096)return {};UINT32 s=0;stride=SUCCEEDED(type->GetUINT32(MF_MT_DEFAULT_STRIDE,&s))?(LONG)s:(LONG)width*4;}
             if(sample)break;
         }
+        if(!sample)return false;LONGLONG value=0;if(SUCCEEDED(sample->GetSampleDuration(&value))&&value>0)duration=value;return true;
+    }
+    std::shared_ptr<const PixelImage> pixels(){
         if(!sample)return {};Com<IMFMediaBuffer> buffer;if(FAILED(sample->ConvertToContiguousBuffer(buffer.put())))return {};
         BYTE* bytes=nullptr;DWORD length=0;if(FAILED(buffer->Lock(&bytes,nullptr,&length)))return {};
         auto image=std::make_shared<PixelImage>();image->width=width;image->height=height;image->id=mediaImageId++;
         size_t pitch=std::abs(stride);bool valid=pitch>=width*4&&length>=pitch*(height-1)+width*4;
-        if(valid){image->bgra.resize((size_t)width*height*4);for(UINT32 y=0;y<height;y++){auto row=bytes+(stride<0?height-1-y:y)*pitch;memcpy(image->bgra.data()+(size_t)y*width*4,row,width*4);}for(size_t i=3;i<image->bgra.size();i+=4)image->bgra[i]=255;}
+        if(valid){image->bgra.resize((size_t)width*height*4);for(UINT32 y=0;y<height;y++){auto row=bytes+(stride<0?height-1-y:y)*pitch;auto out=image->bgra.data()+(size_t)y*width*4;for(UINT32 x=0;x<width;x++){uint32_t pixel;memcpy(&pixel,row+x*4,4);pixel|=0xff000000u;memcpy(out+x*4,&pixel,4);}}}
         buffer->Unlock();return valid?image:nullptr;
     }
+    std::shared_ptr<const PixelImage> next(bool& ended){return read(ended)?pixels():nullptr;}
     bool rewind(){PROPVARIANT position{};position.vt=VT_I8;position.hVal.QuadPart=0;return SUCCEEDED(reader->SetCurrentPosition(GUID_NULL,position));}
 };
 }
 void WallpaperMedia::start(const std::wstring& key,bool enabled){if(worker.joinable())return;prefix=key;state.enabled=enabled;stopping=false;worker=std::thread([this]{run();});}
 void WallpaperMedia::stop(){{std::lock_guard l(mutex);stopping=true;}wake.notify_all();if(worker.joinable())worker.join();}
-void WallpaperMedia::choose(HWND owner,bool video){auto path=chooseWallpaper(owner,video);if(path.empty())return;{std::lock_guard l(mutex);request=path;++generation;state.loading=true;state.error.clear();}wake.notify_all();}
+bool WallpaperMedia::choose(HWND owner,bool video){auto path=chooseWallpaper(owner,video);if(path.empty())return false;{std::lock_guard l(mutex);request=path;++generation;state.loading=true;state.error.clear();}wake.notify_all();return true;}
 void WallpaperMedia::clear(){{std::lock_guard l(mutex);++generation;request.clear();state={};}wake.notify_all();}
 void WallpaperMedia::enable(bool value){{std::lock_guard l(mutex);state.enabled=value;}wake.notify_all();}
 void WallpaperMedia::setActive(bool value){bool changed;{std::lock_guard l(mutex);changed=active!=value;active=value;}if(changed)wake.notify_all();}
@@ -98,11 +115,14 @@ void WallpaperMedia::run(){
             }continue;
         }
         if(loaded!=revision){video.reader.reset();continue;}
-        bool ended=false;auto image=video.next(ended);if(ended){if(!video.rewind())video.reader.reset();timing=false;continue;}
-        if(!image){std::lock_guard l(mutex);state.error=L"Не удалось прочитать кадр видео";video.reader.reset();continue;}
+        bool ended=false;bool decoded=video.read(ended);if(ended){if(!video.rewind())video.reader.reset();timing=false;continue;}
+        if(!decoded){std::lock_guard l(mutex);state.error=L"Не удалось прочитать кадр видео";video.reader.reset();continue;}
         if(!timing){base=GetTickCount64();first=video.timestamp;timing=true;}
         auto due=base+(ULONGLONG)std::max<LONGLONG>(0,(video.timestamp-first)/10000);
-        {std::unique_lock l(mutex);if(!active||!state.enabled){timing=false;continue;}auto now=GetTickCount64();if(due>now)wake.wait_for(l,std::chrono::milliseconds(std::min<ULONGLONG>(due-now,1000)),[&]{return stopping||generation!=loaded||!active;});if(stopping)break;if(generation==loaded&&active)state.image=std::move(image);}
+        // Decode dependencies in order, but do not copy/upload frames whose display time has passed.
+        if(due+std::max<LONGLONG>(1,video.duration/10000)<GetTickCount64())continue;
+        auto image=video.pixels();if(!image){std::lock_guard l(mutex);state.error=L"Не удалось прочитать кадр видео";video.reader.reset();continue;}
+        {std::unique_lock l(mutex);if(!active||!state.enabled){timing=false;continue;}auto now=GetTickCount64();while(due>now&&!stopping&&generation==loaded&&active&&state.enabled){wake.wait_for(l,std::chrono::milliseconds(due-now),[&]{return stopping||generation!=loaded||!active||!state.enabled;});now=GetTickCount64();}if(stopping)break;if(generation==loaded&&active&&state.enabled)state.image=std::move(image);else timing=false;}
     }
-    video.reader.reset();if(mf)MFShutdown();CoUninitialize();
+    video.sample.reset();video.reader.reset();video.manager.reset();video.device.reset();if(mf)MFShutdown();CoUninitialize();
 }

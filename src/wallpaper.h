@@ -19,7 +19,7 @@ public:
     ~WallpaperMedia(){stop();}
     void start(const std::wstring& key,bool enabled=false);
     void stop();
-    void choose(HWND owner,bool video=false);
+    bool choose(HWND owner,bool video=false);
     void clear();
     void enable(bool value);
     void setActive(bool value);

@@ -17,6 +17,7 @@
 #include "components.h"
 #include "native_desktop.h"
 #include "wallpaper.h"
+#include "wallpaper_engine.h"
 #include "dock.h"
 #include <wtsapi32.h>
 #include <windowsx.h>
@@ -1144,6 +1145,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
     if(!explicitMode)StandaloneMode=GetPrivateProfileIntW(L"shell",L"standalone",0,(stateDirectory()+L"\\settings.ini").c_str())!=0;
     std::wstring arg=arguments.empty()?L"":arguments[0];
     auto value=arguments.size()>1?arguments[1]:L"";
+    if(arg==L"--wallpaper-watch"){int result=wallpaperEngineWatch(arguments);LocalFree(argv);OleUninitialize();CoUninitialize();return result;}
     wchar_t modulePath[32768]={};GetModuleFileNameW(nullptr,modulePath,32768);auto moduleName=std::filesystem::path(modulePath).filename().wstring();
     if(!_wcsicmp(moduleName.c_str(),L"Island.Files.exe")&&arg!=L"--files-host"){
         int result=(arg.empty()||arg==L"--files"||arg.front()!=L'-')?runFilesComponent(arg==L"--files"?value:arg):2;LocalFree(argv);OleUninitialize();CoUninitialize();return result;

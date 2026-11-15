@@ -80,6 +80,25 @@ std::shared_ptr<const PixelImage> readIcon(const std::wstring& path,HWND hwnd,ui
     auto result=iconPixels(owned,id);if(owned)DestroyIcon(owned);return result;
 }
 struct RawWindow {TaskWindow window;std::wstring path,id,cls;};
+struct TaskIdentity {std::wstring title;DWORD appPid=0;};
+TaskIdentity taskIdentity(HWND frame,DWORD pid,const wchar_t* cls){
+    wchar_t title[1024]={};GetWindowTextW(frame,title,1024);TaskIdentity result{title,pid};
+    if(wcscmp(cls,L"ApplicationFrameWindow"))return result;
+    struct Core {HWND frame;unsigned count=0;DWORD pid=0;std::wstring title;} core{frame};
+    EnumChildWindows(frame,[](HWND child,LPARAM data)->BOOL{
+        auto& core=*(Core*)data;if(GetParent(child)!=core.frame||!IsWindowVisible(child))return TRUE;
+        wchar_t cls[128]={};GetClassNameW(child,cls,128);if(wcscmp(cls,L"Windows.UI.Core.CoreWindow"))return TRUE;
+        DWORD cloak=0;if(SUCCEEDED(DwmGetWindowAttribute(child,DWMWA_CLOAKED,&cloak,sizeof(cloak)))&&cloak)return TRUE;
+        DWORD pid=0;GetWindowThreadProcessId(child,&pid);if(!pid)return TRUE;
+        if(++core.count>1)return FALSE;
+        wchar_t title[1024]={};GetWindowTextW(child,title,1024);core.title=title;core.pid=pid;return TRUE;
+    },(LPARAM)&core);
+    // A hosted app can have a titled CoreWindow and an untitled frame. Keep
+    // the frame as the task/action identity and use one unique direct core
+    // only for its display title and executable. Never choose the last child.
+    if(core.count==1){result.appPid=core.pid;if(result.title.empty())result.title=std::move(core.title);}
+    return result;
+}
 BOOL CALLBACK collect(HWND hwnd,LPARAM param){
     auto& rows=*(std::vector<RawWindow>*)param;
     if(!IsWindowVisible(hwnd)||hwnd==GetShellWindow())return TRUE;
@@ -87,11 +106,10 @@ BOOL CALLBACK collect(HWND hwnd,LPARAM param){
     LONG_PTR ex=GetWindowLongPtrW(hwnd,GWL_EXSTYLE);
     if(!(ex&WS_EX_APPWINDOW)&&((ex&WS_EX_TOOLWINDOW)||GetWindow(hwnd,GW_OWNER)))return TRUE;
     DWORD cloaked=0;if(SUCCEEDED(DwmGetWindowAttribute(hwnd,DWMWA_CLOAKED,&cloaked,sizeof(cloaked)))&&cloaked)return TRUE;
-    wchar_t cls[256]={},title[1024]={};GetClassNameW(hwnd,cls,256);GetWindowTextW(hwnd,title,1024);
-    if(!*title||!wcscmp(cls,L"Progman")||!wcscmp(cls,L"WorkerW")||!wcscmp(cls,L"Shell_TrayWnd")||!wcscmp(cls,L"Shell_SecondaryTrayWnd"))return TRUE;
-    DWORD appPid=pid;
-    if(!wcscmp(cls,L"ApplicationFrameWindow"))EnumChildWindows(hwnd,[](HWND child,LPARAM data)->BOOL{wchar_t c[128]={};GetClassNameW(child,c,128);if(!wcscmp(c,L"Windows.UI.Core.CoreWindow"))GetWindowThreadProcessId(child,(DWORD*)data);return TRUE;},(LPARAM)&appPid);
-    rows.push_back({{hwnd,pid,title},executable(appPid),applicationId(hwnd),cls});return TRUE;
+    wchar_t cls[256]={};GetClassNameW(hwnd,cls,256);
+    if(!wcscmp(cls,L"Progman")||!wcscmp(cls,L"WorkerW")||!wcscmp(cls,L"Shell_TrayWnd")||!wcscmp(cls,L"Shell_SecondaryTrayWnd"))return TRUE;
+    auto identity=taskIdentity(hwnd,pid,cls);if(identity.title.empty())return TRUE;
+    rows.push_back({{hwnd,pid,std::move(identity.title)},executable(identity.appPid),applicationId(hwnd),cls});return TRUE;
 }
 bool same(const TaskSnapshot& a,const TaskSnapshot& b){
     if(a.groups.size()!=b.groups.size()||a.shortcuts!=b.shortcuts)return false;
@@ -145,10 +163,10 @@ bool isTaskWindow(HWND hwnd){
     DWORD pid=0;GetWindowThreadProcessId(hwnd,&pid);if(!pid)return false;if(pid==GetCurrentProcessId()){wchar_t cls[100]={};GetClassNameW(hwnd,cls,100);if(wcscmp(cls,L"OwnIsland.Files"))return false;}
     LONG_PTR ex=GetWindowLongPtrW(hwnd,GWL_EXSTYLE);if(!(ex&WS_EX_APPWINDOW)&&((ex&WS_EX_TOOLWINDOW)||GetWindow(hwnd,GW_OWNER)))return false;
     DWORD cloaked=0;if(SUCCEEDED(DwmGetWindowAttribute(hwnd,DWMWA_CLOAKED,&cloaked,sizeof(cloaked)))&&cloaked)return false;
-    wchar_t cls[128]={},title[2]={};GetClassNameW(hwnd,cls,128);GetWindowTextW(hwnd,title,2);
-    return *title&&wcscmp(cls,L"Progman")&&wcscmp(cls,L"WorkerW")&&wcscmp(cls,L"Shell_TrayWnd")&&wcscmp(cls,L"Shell_SecondaryTrayWnd");
+    wchar_t cls[128]={};GetClassNameW(hwnd,cls,128);
+    return wcscmp(cls,L"Progman")&&wcscmp(cls,L"WorkerW")&&wcscmp(cls,L"Shell_TrayWnd")&&wcscmp(cls,L"Shell_SecondaryTrayWnd")&&!taskIdentity(hwnd,pid,cls).title.empty();
 }
-std::vector<TaskWindow> taskWindows(){std::vector<TaskWindow> result;EnumWindows([](HWND hwnd,LPARAM data)->BOOL{if(isTaskWindow(hwnd)){DWORD pid=0;GetWindowThreadProcessId(hwnd,&pid);wchar_t title[1024]={};GetWindowTextW(hwnd,title,1024);((std::vector<TaskWindow>*)data)->push_back({hwnd,pid,title});}return TRUE;},(LPARAM)&result);return result;}
+std::vector<TaskWindow> taskWindows(){std::vector<TaskWindow> result;EnumWindows([](HWND hwnd,LPARAM data)->BOOL{if(isTaskWindow(hwnd)){DWORD pid=0;GetWindowThreadProcessId(hwnd,&pid);wchar_t cls[128]={};GetClassNameW(hwnd,cls,128);auto identity=taskIdentity(hwnd,pid,cls);if(!identity.title.empty())((std::vector<TaskWindow>*)data)->push_back({hwnd,pid,std::move(identity.title)});}return TRUE;},(LPARAM)&result);return result;}
 bool activateTaskWindow(const TaskWindow& window,bool toggle){
     if(!validTaskWindow(window))return false;
     // Tool windows can temporarily clear the foreground during a mouse click.

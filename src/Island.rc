@@ -5,8 +5,8 @@
 1 ICON "Island.ico"
 1 RT_MANIFEST "Island.manifest"
 1 VERSIONINFO
-FILEVERSION 0,20,1,0
-PRODUCTVERSION 0,20,1,0
+FILEVERSION 0,21,0,0
+PRODUCTVERSION 0,21,0,0
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
@@ -16,7 +16,7 @@ BEGIN
   BEGIN
    VALUE "FileDescription", "Own Island desktop overlay\0"
    VALUE "ProductName", "Own Island\0"
-   VALUE "FileVersion", "0.20.1\0"
+   VALUE "FileVersion", "0.21.0\0"
    VALUE "OriginalFilename", "Island.exe\0"
   END
  END

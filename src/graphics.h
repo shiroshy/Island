@@ -93,6 +93,7 @@ public:
     bool outlineSmooth=true;
     bool shadowEnabled=false;
     bool init(HWND hwnd, UINT width, UINT height, float dpiScale, bool opaque=false);
+    ID3D11Device* renderDevice()const{return d3d.p;}
     bool resize(UINT width, UINT height, float dpiScale);
     void begin();
     bool end();

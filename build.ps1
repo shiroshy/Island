@@ -44,7 +44,7 @@ $pathMappings = @(
     ('-ffile-prefix-map=' + [IO.Path]::GetFullPath($CompilerRoot) + '=external/llvm-mingw')
 )
 $compileFlags += $pathMappings
-$sources = @('app.cpp','platform.cpp','graphics.cpp','picker.cpp','audio.cpp','menu.cpp','tasks.cpp','shell.cpp','overlay.cpp','search.cpp','desktop.cpp','wallpaper.cpp','network.cpp','widget_image.cpp','native_desktop.cpp','runtime.cpp','tray.cpp','file_browser.cpp','file_ops.cpp','components.cpp')
+$sources = @('app.cpp','platform.cpp','graphics.cpp','picker.cpp','audio.cpp','menu.cpp','tasks.cpp','shell.cpp','overlay.cpp','search.cpp','desktop.cpp','wallpaper.cpp','wallpaper_engine.cpp','network.cpp','widget_image.cpp','native_desktop.cpp','runtime.cpp','tray.cpp','file_browser.cpp','file_ops.cpp','components.cpp')
 $objectRoot = Join-Path $CacheRoot 'objects'
 New-Item -ItemType Directory -Path $objectRoot -Force | Out-Null
 $compiler = Join-Path $CompilerRoot 'bin\clang++.exe'

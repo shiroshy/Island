@@ -9,6 +9,7 @@
 #include "menu.h"
 #include "search.h"
 #include "wallpaper.h"
+#include "wallpaper_engine.h"
 #include "widget_image.h"
 #include "widget_geometry.h"
 #include <windowsx.h>
@@ -107,7 +108,7 @@ struct Desktop::Impl {
     bool photo=false;
     void saveAppearance(){WritePrivateProfileStringW(L"desktop",L"wallpaper-preset",std::to_wstring(preset).c_str(),ini.c_str());WritePrivateProfileStringW(L"desktop",L"wallpaper-fit",std::to_wstring(placement).c_str(),ini.c_str());WritePrivateProfileStringW(L"desktop",L"wallpaper-shade",std::to_wstring(shade).c_str(),ini.c_str());}
     void selectPreset(int p){media.clear();preset=p;photo=false;saveAppearance();WritePrivateProfileStringW(L"desktop",L"wallpaper-photo",L"0",ini.c_str());}
-    void selectWallpaper(bool video=false){media.choose(owner,video);}
+    bool selectWallpaper(bool video=false){return media.choose(owner,video);}
     void run();void rebuild();void stop();void refresh(){std::lock_guard lock(mutex);dirty=true;wake.notify_one();}
     void invoke(int code,const std::wstring& value=L""){if(action)action(code,value);}
     void addFile(const std::wstring& path){bool added=false;{std::lock_guard lock(mutex);if(std::find(extraFiles.begin(),extraFiles.end(),path)==extraFiles.end()&&extraFiles.size()<64){extraFiles.push_back(path);added=true;}}if(added){saveFiles();refresh();}}
@@ -132,6 +133,8 @@ struct Desktop::Impl::View {
     bool arranging=false,savedShadow=false;int grid=16,savedGrid=16,savedPage=0,dragWidget=-1,selectedWidget=-1,renderingWidget=-1;
     int eqMode=0,eqFPS=30,eqBands=48;float eqGain=1;bool eqEnabled=true,eqSmooth=true,eqPeaks=true,eqNumbers=true;
     WidgetImageMedia imageMedia;WidgetImageState imageState;
+    EngineWallpaper engineWallpaper;EngineWallpaperState engineState;HWND lastEngineWindow=nullptr;bool awaitingLocalWallpaper=false,localWallpaperError=false;
+    void engineMenu();
     void saveEQ(){for(auto pair:{std::pair{L"eq-mode",eqMode},std::pair{L"eq-fps",eqFPS},std::pair{L"eq-bands",eqBands},std::pair{L"eq-enabled",eqEnabled?1:0},std::pair{L"eq-smooth",eqSmooth?1:0},std::pair{L"eq-peaks",eqPeaks?1:0},std::pair{L"eq-numbers",eqNumbers?1:0}})WritePrivateProfileStringW(layoutSection.c_str(),pair.first,std::to_wstring(pair.second).c_str(),parent->ini.c_str());WritePrivateProfileStringW(layoutSection.c_str(),L"eq-gain",std::to_wstring(eqGain).c_str(),parent->ini.c_str());}
     float grabX=0,grabY=0;int dragHandle=-1;Box resizeStart{};float resizeX=0,resizeY=0;
     bool eqSettings=false,suppressPanel=false;float drawK=1,drawX=0,drawY=0;Box renderBox{};ULONGLONG eqTick=0;
@@ -158,8 +161,11 @@ struct Desktop::Impl::View {
     ULONGLONG animation=0,lastFrame=0,lastDraw=0,clockTick=0,lastVisibility=0;
     std::array<float,48> levels{},peaks{};SpectrumFrame spectrum;
     View(Impl* p):parent(p){std::iota(order.begin(),order.end(),0);}
-    ~View(){if(IsWindow(hwnd))DestroyWindow(hwnd);if(IsWindow(backdrop))DestroyWindow(backdrop);if(font)DeleteObject(font);if(timerFont)DeleteObject(timerFont);if(brush)DeleteObject(brush);if(noteMask)DeleteObject(noteMask);if(timerMask)DeleteObject(timerMask);}
+    ~View(){engineWallpaper.stop();if(IsWindow(hwnd))DestroyWindow(hwnd);if(IsWindow(backdrop))DestroyWindow(backdrop);if(font)DeleteObject(font);if(timerFont)DeleteObject(timerFont);if(brush)DeleteObject(brush);if(noteMask)DeleteObject(noteMask);if(timerMask)DeleteObject(timerMask);}
     Box box(float x,float y,float w,float h)const{return {left+x,top+y,w,h};}
+    Box appearanceBounds()const{return box(1190,86,410,716);}
+    Box equalizerBounds()const{return {(width-454)/2,std::max(50.f,(height-748)/2),454,748};}
+    bool overlayAt(float x,float y)const{return (appearance&&appearanceBounds().contains(x,y))||(eqSettings&&equalizerBounds().contains(x,y));}
     void add(Box b,std::function<void()> click,int kind=0,int index=-1,std::wstring path=L""){b={drawX+b.x*drawK,drawY+b.y*drawK,b.w*drawK,b.h*drawK};hits.push_back({b,std::move(click),kind,index,std::move(path),renderingWidget});}
     void label(const std::wstring& s,Box b,float size=13,unsigned color=0,bool bold=false,DWRITE_TEXT_ALIGNMENT align=DWRITE_TEXT_ALIGNMENT_LEADING){gfx->text(s,b,size,color?color:data.ink,bold,align,false,L"Bahnschrift");}
     unsigned inputColor()const{return blend(data.background,data.card,.88f);}
@@ -198,7 +204,7 @@ Box Desktop::Impl::View::bounds(int id)const{auto b=baseBounds(id);auto min=mini
 Box Desktop::Impl::View::contentBox(int id,Box value)const{auto b=baseBounds(id),a=bounds(id);float k=std::min(a.w/b.w,a.h/b.h);return {a.x+(a.w-b.w*k)/2+(value.x-b.x)*k,a.y+(a.h-b.h*k)/2+(value.y-b.y)*k,value.w*k,value.h*k};}
 Box Desktop::Impl::View::titleBox(int id)const{auto b=rotatedWidgetBounds(bounds(id),layout[id].angle);float w=std::min(280.f,(gfx?gfx->textWidth(widgetName(id)):wcslen(widgetName(id))*7.f)+20);return {std::clamp(b.x+14,12.f,std::max(12.f,width-w-40)),std::max(8.f,b.y-28),w,24};}
 int Desktop::Impl::View::widgetAt(float x,float y)const{for(auto it=order.rbegin();it!=order.rend();++it)if(layout[*it].shown&&onPage(*it)&&!(appearance&&(*it==Weather||*it==Music||*it==Tools))&&(widgetContains(*it,x,y)||(arranging&&(titleBox(*it).contains(x,y)||closeBox(*it).contains(x,y)))))return *it;return -1;}
-int Desktop::Impl::View::hitAt(float x,float y)const{for(size_t i=0;i<hits.size();i++)if(hits[i].widget==-2&&hits[i].box.contains(x,y))return (int)i;if(arranging)return -1;int widget=widgetAt(x,y);for(size_t i=0;i<hits.size();i++)if(hits[i].widget==widget&&widget!=Spectrum&&hitContains(hits[i],x,y))return (int)i;return -1;}
+int Desktop::Impl::View::hitAt(float x,float y)const{for(size_t i=0;i<hits.size();i++)if(hits[i].widget==-2&&hits[i].box.contains(x,y))return (int)i;if(arranging||overlayAt(x,y))return -1;int widget=widgetAt(x,y);for(size_t i=0;i<hits.size();i++)if(hits[i].widget==widget&&widget!=Spectrum&&hitContains(hits[i],x,y))return (int)i;return -1;}
 void Desktop::Impl::View::resetLayout(){layout={};for(int i=0;i<WidgetCount;i++){order[i]=i;layout[i].shown=i<Calendar;layout[i].background=i!=Clock&&i!=Spectrum&&i!=Controls&&i!=Image;}selectedWidget=-1;}
 void Desktop::Impl::View::loadLayout(){
     resetLayout();layout[Clock].shadow=parent->clockShadow;MONITORINFOEXW info{};info.cbSize=sizeof(info);GetMonitorInfoW(MonitorFromRect(&monitor,MONITOR_DEFAULTTONEAREST),&info);std::wstring device=info.szDevice;for(auto& c:device)if(!iswalnum(c))c=L'_';layoutSection=L"desktop-layout-"+device;
@@ -241,7 +247,7 @@ void Desktop::Impl::View::clockCaption(const std::wstring& text,Box b,float size
 void Desktop::Impl::View::imageWidget(){auto b=baseBounds(Image);if(imageState.image){float pad=layout[Image].background?12:0;gfx->sprite(imageState.image,{b.x+pad,b.y+pad,b.w-2*pad,b.h-2*pad},layout[Image].mediaFit);}else button({b.x+18,b.y+b.h/2-20,b.w-36,40},L"\uE8B9",imageState.loading?L"Загрузка…":L"Выбрать изображение / GIF",[this]{imageMedia.choose(parent->owner);});if(!imageState.error.empty())label(imageState.error,{b.x+18,b.y+b.h-38,b.w-36,28},11,0xe7a29a);}
 void Desktop::Impl::View::resize(){
     RECT r{};GetClientRect(hwnd,&r);scale=std::max(.35f,std::min((r.right-r.left)/1728.f,(r.bottom-r.top)/972.f));width=r.right/scale;height=r.bottom/scale;left=(width-1600)/2;top=(height-840)/2+4;
-    gfx=std::make_unique<Graphics>();if(!gfx->init(hwnd,r.right,r.bottom,scale,true)){gfx.reset();return;}
+    gfx=std::make_unique<Graphics>();if(!gfx->init(hwnd,r.right,r.bottom,scale,false)){gfx.reset();return;}
     if(font)DeleteObject(font);if(timerFont)DeleteObject(timerFont);
     font=CreateFontW(-(int)std::lround(15*scale),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,ANTIALIASED_QUALITY,DEFAULT_PITCH,L"Segoe UI");
     timerFont=CreateFontW(-(int)std::lround(51*scale),0,0,0,FW_BOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,ANTIALIASED_QUALITY,DEFAULT_PITCH,L"Bahnschrift");
@@ -378,7 +384,7 @@ void Desktop::Impl::View::foldersWidget(){
     label(L"Папки",box(704,386,300,32),20,0,true);const wchar_t* names[]={L"Загрузки",L"Документы",L"Изображения",L"Рабочий стол"};const KNOWNFOLDERID* ids[]={&FOLDERID_Downloads,&FOLDERID_Documents,&FOLDERID_Pictures,&FOLDERID_Desktop};for(int i=0;i<4;i++)button(box(700+(i%2)*160,438+(i/2)*58,148,46),L"\uE8B7",names[i],[id=ids[i]]{openTarget(knownFolder(*id));});
 }
 void Desktop::Impl::View::eqControls(){
-    float x=(width-454)/2,y=std::max(50.f,(height-748)/2);auto panelBox=Box{x,y,454,748};gfx->fill(panelBox,data.background,22,.99f);label(L"Эквалайзер",{x+24,y+14,350,38},22,0,true);iconButton({x+396,y+17,34,34},L"\uE711",[this]{eqSettings=false;draw();});
+    auto panelBox=equalizerBounds();float x=panelBox.x,y=panelBox.y;gfx->fill(panelBox,data.background,22,.99f);label(L"Эквалайзер",{x+24,y+14,350,38},22,0,true);iconButton({x+396,y+17,34,34},L"\uE711",[this]{eqSettings=false;draw();});
     bool enabled=eqEnabled&&layout[Spectrum].shown;
     const wchar_t* modes[]={L"Столбцы",L"Волна",L"Линия",L"Зеркало",L"Радиальный",L"Матрица",L"Лента",L"Индикатор"};for(int i=0;i<8;i++)button({x+22+(i%4)*104,y+70+(i/4)*42,98,34},nullptr,modes[i],[this,i]{eqMode=i;saveEQ();draw();},eqMode==i,enabled);
     auto choices=[&](float py,const wchar_t* caption,std::initializer_list<int> values,int current,std::function<void(int)> action,const wchar_t* suffix){label(caption,{x+24,y+py,400,25},12,data.muted);float px=x+22;for(int n:values){button({px,y+py+33,96,34},nullptr,std::to_wstring(n)+suffix,[action,n]{action(n);},current==n,enabled);px+=104;}};
@@ -389,20 +395,29 @@ void Desktop::Impl::View::eqControls(){
 }
 void Desktop::Impl::View::background(){
     unsigned base[]={0x0a1420,0x1d1117,0x11161b},end[]={0x123437,0x44302c,0x29343a},tint[]={0x66bcae,0xe1a77d,0xa6b9c4};int preset=parent->preset;
-    gfx->fill({0,0,width,height},base[preset]);
-    if(photo&&wallpaper)gfx->picture(wallpaper,{0,0,width,height},parent->placement);
+    bool external=engineState.enabled&&data.performance.video&&IsWindow(engineState.window)&&GetParent(engineState.window)==backdrop;
+    SetPropW(hwnd,L"OwnIsland.EngineSource",external?engineState.window:nullptr);
+    if(!external)gfx->fill({0,0,width,height},base[preset]);
+    if(external){}
+    else if(photo&&wallpaper)gfx->picture(wallpaper,{0,0,width,height},parent->placement);
     else {gfx->releaseWallpaper();gfx->gradient({0,0,width,height},base[preset],end[preset],false);gfx->glow({width*.2f,-height*.5f,width*1.1f,height*1.4f},preset==0?0x3d5b87:tint[preset],.38f);gfx->glow({width*.35f,height*.24f,width*.8f,height*.9f},tint[preset],.25f);for(int i=0;i<5;i++)gfx->ribbon({-100.f-i*20,height*.05f+i*34,width*1.15f,height*.92f},tint[preset],.045f+i*.017f);}
     gfx->fill({0,0,width,height},0,0,parent->shade/100.f);
     gfx->gradient({0,0,width,height},0,0,false,.24f,0);
     gfx->line(width/2,36,width/2,std::max(36.f,top-16),blend(base[preset],data.accent,.45f),1);
 }
+void Desktop::Impl::View::engineMenu(){
+    POINT p{};GetCursorPos(&p);menu=true;int action=customMenu(hwnd,p,{{L"Текущие обои",nullptr,1},{L"Выбрать обои",nullptr,2},{L"Отключить",nullptr,3,engineState.enabled}},{data.background,data.hover,data.ink,data.muted,data.accent,data.outline,data.outlineWidth,data.outlineSmooth});menu=false;
+    if(action==1||action==2){awaitingLocalWallpaper=localWallpaperError=false;menu=true;engineWallpaper.choose(parent->owner,action==1);menu=false;}if(action==3)engineWallpaper.disable();draw();
+}
 void Desktop::Impl::View::wallpaperControls(){
-    panel(box(1190,86,410,716));label(L"Оформление",box(1216,105,310,43),23,0,true);iconButton(box(1501,108,34,34),L"\uE790",[this]{parent->invoke(DeskAppearance);});iconButton(box(1542,108,34,34),L"\uE711",[this]{appearance=false;draw();});
+    panel(appearanceBounds());label(L"Оформление",box(1216,105,310,43),23,0,true);iconButton(box(1501,108,34,34),L"\uE790",[this]{parent->invoke(DeskAppearance);});iconButton(box(1542,108,34,34),L"\uE711",[this]{appearance=false;draw();});
     const wchar_t* names[]={L"Сумерки",L"Дюны",L"Графит"};unsigned bases[]={0x0b2334,0x382329,0x202d33},ends[]={0x3e7e7d,0xc59468,0x7b8b91};
-    for(int i=0;i<3;i++){Box b=box(1214+i*123,168,112,102);gfx->fill(b,data.card,16);gfx->clipRounded({b.x+4,b.y+4,b.w-8,62},12);gfx->gradient({b.x+4,b.y+4,b.w-8,62},bases[i],ends[i],false);gfx->ribbon({b.x,b.y-10,b.w,78},data.ink,.15f);gfx->unclipRounded();if(!photo&&parent->preset==i)gfx->stroke(b,data.accent,16,1.5f);label(names[i],{b.x,b.y+70,b.w,26},11,0,false,DWRITE_TEXT_ALIGNMENT_CENTER);add(b,[this,i]{parent->selectPreset(i);draw();});}
-    button(box(1214,292,174,43),L"\uE8B9",L"Изображение",[this]{parent->selectWallpaper();draw();});button(box(1400,292,174,43),L"\uE714",L"Видео",[this]{parent->selectWallpaper(true);draw();},false,data.performance.video);
-    label(wallLoading?L"Загрузка…":!wallError.empty()?wallError:photo?wallName:L"",box(1216,340,358,30),11,wallError.empty()?data.muted:0xe7a29a);
-    label(L"Масштаб",box(1216,390,350,28),13,data.muted);const wchar_t* modes[]={L"Заполнить",L"Вписать",L"Растянуть"};for(int i=0;i<3;i++)button(box(1214+i*123,429,112,36),nullptr,modes[i],[this,i]{parent->placement=i;parent->saveAppearance();draw();},parent->placement==i,photo);
+    for(int i=0;i<3;i++){Box b=box(1214+i*123,168,112,102);gfx->fill(b,data.card,16);gfx->clipRounded({b.x+4,b.y+4,b.w-8,62},12);gfx->gradient({b.x+4,b.y+4,b.w-8,62},bases[i],ends[i],false);gfx->ribbon({b.x,b.y-10,b.w,78},data.ink,.15f);gfx->unclipRounded();if(!engineState.enabled&&!photo&&parent->preset==i)gfx->stroke(b,data.accent,16,1.5f);label(names[i],{b.x,b.y+70,b.w,26},11,0,false,DWRITE_TEXT_ALIGNMENT_CENTER);add(b,[this,i]{awaitingLocalWallpaper=localWallpaperError=false;engineWallpaper.disable();parent->selectPreset(i);draw();});}
+    button(box(1214,292,174,38),L"\uE8B9",L"Изображение",[this]{if(parent->selectWallpaper()){awaitingLocalWallpaper=true;localWallpaperError=false;}draw();});button(box(1400,292,174,38),L"\uE714",L"Видео",[this]{if(parent->selectWallpaper(true)){awaitingLocalWallpaper=true;localWallpaperError=false;}draw();},false,data.performance.video);
+    button(box(1214,338,360,36),nullptr,L"Wallpaper Engine",[this]{engineMenu();},engineState.enabled,data.performance.video);
+    auto error=localWallpaperError?wallError:!engineState.error.empty()?engineState.error:engineState.enabled?L"":wallError;
+    label(awaitingLocalWallpaper||engineState.loading?L"Загрузка…":!error.empty()?error:engineState.enabled?engineState.name:wallLoading?L"Загрузка…":photo?wallName:L"",box(1216,376,358,24),11,error.empty()?data.muted:0xe7a29a);
+    label(L"Масштаб",box(1216,405,350,24),13,data.muted);const wchar_t* modes[]={L"Заполнить",L"Вписать",L"Растянуть"};for(int i=0;i<3;i++)button(box(1214+i*123,439,112,36),nullptr,modes[i],[this,i]{parent->placement=i;parent->saveAppearance();draw();},parent->placement==i,photo&&!engineState.enabled);
     label(L"Затемнение",box(1216,501,240,28),13,data.muted);label(std::to_wstring(parent->shade)+L"%",box(1487,501,86,28),13,data.ink,false,DWRITE_TEXT_ALIGNMENT_TRAILING);
     Box slider=box(1220,548,347,26);gfx->fill({slider.x,slider.y+11,slider.w,4},data.hover,2);gfx->fill({slider.x,slider.y+11,slider.w*parent->shade/75,4},data.accent,2);gfx->fill({slider.x+slider.w*parent->shade/75-6,slider.y+7,12,12},data.ink,6);add(slider,[this,slider]{POINT p;GetCursorPos(&p);ScreenToClient(hwnd,&p);parent->shade=std::clamp((int)std::lround((p.x/scale-slider.x)/slider.w*75),0,75);parent->saveAppearance();draw();},6);
     label(L"Дизайн часов",box(1216,596,210,26),13,data.muted);button(box(1440,590,134,32),layout[Clock].shadow?L"\uE73D":L"\uE739",L"Тень",[this]{layout[Clock].shadow=!layout[Clock].shadow;saveLayout();draw();},layout[Clock].shadow,layout[Clock].shown);
@@ -415,7 +430,7 @@ void Desktop::Impl::View::draw(){
     SetPropW(hwnd,L"OwnIsland.Editing",(HANDLE)(UINT_PTR)arranging);SetPropW(hwnd,L"OwnIsland.ClockShadow",(HANDLE)(UINT_PTR)layout[Clock].shadow);
     for(int id=0;id<WidgetCount;id++){auto b=bounds(id);auto prefix=L"OwnIsland.Widget"+std::to_wstring(id);SetPropW(hwnd,(prefix+L"X").c_str(),(HANDLE)(INT_PTR)(int)b.x);SetPropW(hwnd,(prefix+L"Y").c_str(),(HANDLE)(INT_PTR)(int)b.y);SetPropW(hwnd,(prefix+L"Visible").c_str(),(HANDLE)(UINT_PTR)layout[id].shown);SetPropW(hwnd,(prefix+L"W").c_str(),(HANDLE)(INT_PTR)(int)b.w);SetPropW(hwnd,(prefix+L"H").c_str(),(HANDLE)(INT_PTR)(int)b.h);SetPropW(hwnd,(prefix+L"Vertical").c_str(),(HANDLE)(UINT_PTR)layout[id].vertical);SetPropW(hwnd,(prefix+L"Angle").c_str(),(HANDLE)(INT_PTR)(int)layout[id].angle);}
 
-    auto stamp=GetTickCount64();data=parent->snapshot();{std::lock_guard lock(parent->mutex);catalog=parent->catalog;}auto media=parent->media.snapshot();wallpaper=media.image;photo=media.enabled;wallLoading=media.loading;motion=media.enabled&&media.video;wallError=media.error;wallName=media.name;imageState=imageMedia.snapshot();
+    auto stamp=GetTickCount64();data=parent->snapshot();{std::lock_guard lock(parent->mutex);catalog=parent->catalog;}auto media=parent->media.snapshot();wallpaper=media.image;photo=media.enabled;wallLoading=media.loading;motion=media.enabled&&media.video;wallError=media.error;wallName=media.name;imageState=imageMedia.snapshot();engineState=engineWallpaper.snapshot();
     float elapsed=animation?std::clamp((stamp-animation)/620.f,0.f,1.f):1,ease=1-std::pow(1-elapsed,4.f);bool animating=elapsed<1;
     gfx->outlineColor=data.outline;gfx->outlineWidth=data.outlineWidth;gfx->outlineSmooth=data.outlineSmooth;gfx->begin();hits.clear();background();
     float revealWidth=240+(width-240)*ease;gfx->clip({(width-revealWidth)/2,0,revealWidth,36+(height-36)*ease});gfx->layer(ease,0,-24*(1-ease));
@@ -437,11 +452,14 @@ void Desktop::Impl::View::draw(){
 void Desktop::Impl::View::pulse(bool force){
     auto stamp=GetTickCount64();data=parent->snapshot();
     if(force||stamp-lastVisibility>=500){bool now=data.awake&&IsWindowVisible(hwnd)&&!monitorBlocked(monitor)&&exposed(monitor);visible=now;lastVisibility=stamp;SetPropW(hwnd,L"OwnIsland.DesktopPaused",(HANDLE)(UINT_PTR)(visible?0:1));}
+    if(awaitingLocalWallpaper){auto local=parent->media.snapshot();if(!local.loading){awaitingLocalWallpaper=false;localWallpaperError=!local.error.empty();if(local.image&&!localWallpaperError)engineWallpaper.disable();}}
+    engineWallpaper.setActive(visible&&data.performance.video);if(!visible||!data.performance.video)RemovePropW(hwnd,L"OwnIsland.EngineSource");engineState=engineWallpaper.snapshot();
+    if(engineState.window!=lastEngineWindow){lastEngineWindow=engineState.window;if(lastEngineWindow)SetWindowPos(hwnd,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_NOOWNERZORDER);}
     imageMedia.setActive(visible&&page==0&&layout[Image].shown&&data.performance.video,data.performance.desktopFPS);if(!visible){if(timerInterval!=250){timerInterval=250;SetTimer(hwnd,1,timerInterval,nullptr);}editors(false);return;}
     bool animating=animation&&stamp-animation<620;
     if(parent->audio)spectrum=parent->audio->spectrum();if(!eqEnabled||!layout[Spectrum].shown)spectrum={};if(layout[System].shown)parent->stats();float dt=lastFrame?std::clamp((stamp-lastFrame)/1000.f,0.f,.1f):.016f;lastFrame=stamp;
     bool changing=false;for(int i=0;i<48;i++){float target=spectrum.bars[i];float old=levels[i];levels[i]=eqSmooth?levels[i]+(target-levels[i])*(1-std::exp(-dt*(target>levels[i]?25:7))):target;peaks[i]=std::max(levels[i],peaks[i]-dt*.35f);changing|=std::abs(old-levels[i])>.0002f;}
-    imageState=imageMedia.snapshot();motion=data.performance.video&&(parent->media.snapshot().video||(layout[Image].shown&&imageState.animated));int fps=std::min(data.performance.desktopFPS,eqFPS);int interval=animating?16:motion?1000/data.performance.desktopFPS:changing||spectrum.rms>.00015f?1000/fps:100;if(interval!=timerInterval){timerInterval=interval;SetTimer(hwnd,1,timerInterval,nullptr);}
+    imageState=imageMedia.snapshot();motion=data.performance.video&&(engineState.enabled||parent->media.snapshot().video||(layout[Image].shown&&imageState.animated));int fps=std::min(data.performance.desktopFPS,eqFPS);int interval=animating?16:motion?1000/data.performance.desktopFPS:changing||spectrum.rms>.00015f?1000/fps:100;if(interval!=timerInterval){timerInterval=interval;SetTimer(hwnd,1,timerInterval,nullptr);}
     auto seconds=stamp/1000;bool tick=clockTick!=seconds;clockTick=seconds;
     if((force||animating||motion||changing||spectrum.rms>.00015f||tick)&&(force||animating||stamp-lastDraw>=(ULONGLONG)(1000/(motion?data.performance.desktopFPS:fps))))draw();
 }
@@ -451,7 +469,7 @@ void Desktop::Impl::View::dragFile(const std::wstring& path){
     if(SUCCEEDED(SHBindToParent(id,IID_PPV_ARGS(folder.put()),&child))&&SUCCEEDED(folder->GetUIObjectOf(hwnd,1,&child,IID_IDataObject,nullptr,(void**)object.put()))){DWORD effect=0;SHDoDragDrop(hwnd,object.p,nullptr,DROPEFFECT_COPY|DROPEFFECT_LINK,&effect);}CoTaskMemFree(id);
 }
 void Desktop::Impl::View::context(POINT position){
-    POINT local=position;ScreenToClient(hwnd,&local);float x=local.x/scale,y=local.y/scale;if(arranging){int id=widgetAt(x,y);if(id>=0)widgetSettings(id);else widgetMenu();return;}if(widgetAt(x,y)==Spectrum)return;Hit hit{};int hitIndex=hitAt(x,y);bool found=hitIndex>=0;if(found)hit=hits[hitIndex];
+    POINT local=position;ScreenToClient(hwnd,&local);float x=local.x/scale,y=local.y/scale;if(overlayAt(x,y))return;if(arranging){int id=widgetAt(x,y);if(id>=0)widgetSettings(id);else widgetMenu();return;}if(widgetAt(x,y)==Spectrum)return;Hit hit{};int hitIndex=hitAt(x,y);bool found=hitIndex>=0;if(found)hit=hits[hitIndex];
     std::vector<MenuItem> items;std::wstring path;
     if(found&&(hit.kind==1||hit.kind==2)){
         path=hit.path;items={{L"Открыть",L"\uE8A5",1},{L"Расположение",L"\uE8B7",2},{L"Копировать путь",L"\uE8C8",3}};
@@ -477,20 +495,20 @@ LRESULT CALLBACK Desktop::Impl::proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_ERASEBKGND:return 1;
     case WM_MOUSEACTIVATE:return MA_NOACTIVATE;
     case WM_TIMER:if(wp==1)v->pulse();if(wp==2){KillTimer(hwnd,2);if(v->note&&v->noteDirty){v->parent->invoke(DeskSaveNote,textOf(v->note));v->noteDirty=false;}}return 0;
-    case WM_SETCURSOR:if(LOWORD(lp)==HTCLIENT){POINT p;GetCursorPos(&p);ScreenToClient(hwnd,&p);float x=p.x/v->scale,y=p.y/v->scale;int handle=v->dragHandle>=0?v->dragHandle:v->resizeHandleAt(x,y);LPCWSTR cursor=v->arranging&&v->widgetAt(x,y)>=0?IDC_SIZEALL:v->hover>=0&&v->hover<(int)v->hits.size()&&v->hits[v->hover].kind>=0?IDC_HAND:IDC_ARROW;if(handle>=0){float directions[]={135,90,45,0,135,90,45,0};int axis=((int)std::lround((directions[handle]+v->layout[v->selectedWidget].angle)/45))%4;cursor=axis==0?IDC_SIZEWE:axis==1?IDC_SIZENESW:axis==2?IDC_SIZENS:IDC_SIZENWSE;}SetCursor(LoadCursorW(nullptr,cursor));return TRUE;}break;
+    case WM_SETCURSOR:if(LOWORD(lp)==HTCLIENT){POINT p;GetCursorPos(&p);ScreenToClient(hwnd,&p);float x=p.x/v->scale,y=p.y/v->scale;int handle=v->overlayAt(x,y)?-1:v->dragHandle>=0?v->dragHandle:v->resizeHandleAt(x,y);LPCWSTR cursor=v->arranging&&!v->overlayAt(x,y)&&v->widgetAt(x,y)>=0?IDC_SIZEALL:v->hover>=0&&v->hover<(int)v->hits.size()&&v->hits[v->hover].kind>=0?IDC_HAND:IDC_ARROW;if(handle>=0){float directions[]={135,90,45,0,135,90,45,0};int axis=((int)std::lround((directions[handle]+v->layout[v->selectedWidget].angle)/45))%4;cursor=axis==0?IDC_SIZEWE:axis==1?IDC_SIZENESW:axis==2?IDC_SIZENS:IDC_SIZENWSE;}SetCursor(LoadCursorW(nullptr,cursor));return TRUE;}break;
     case WM_MOUSEMOVE:{float x=GET_X_LPARAM(lp)/v->scale,y=GET_Y_LPARAM(lp)/v->scale;if(v->arranging&&v->dragHandle>=0){v->resizeWidget(x,y);return 0;}if(v->arranging&&v->dragWidget>=0){int id=v->dragWidget;auto base=v->baseBounds(id);float px=std::round((x-v->grabX)/v->grid)*v->grid,py=std::round((y-v->grabY)/v->grid)*v->grid;auto old=v->bounds(id);auto next=constrainWidget({px,py,old.w,old.h},v->layout[id].angle,v->width,v->height);v->layout[id].x=next.x-v->left-base.x;v->layout[id].y=next.y-v->top-base.y;v->draw();return 0;}
         int next=v->hitAt(x,y);bool overMusic=v->layout[View::Music].shown&&v->widgetContains(View::Music,x,y)&&!v->appearance&&!v->arranging;if(next!=v->hover||overMusic!=v->musicOver){v->hover=next;v->musicOver=overMusic;v->draw();}if(!v->tracking){TRACKMOUSEEVENT track={sizeof(track),TME_LEAVE,hwnd,0};TrackMouseEvent(&track);v->tracking=true;}
         if(v->pressed>=0&&v->pressed<(int)v->hits.size()&&v->hits[v->pressed].kind==8){v->seekDragging=true;v->seekRatio=v->musicRatio(x,y);v->draw();return 0;}
         if(v->pressed>=0&&v->pressed<(int)v->hits.size()&&v->hits[v->pressed].kind==6){auto b=v->hits[v->pressed].box;v->parent->shade=std::clamp((int)std::lround((x-b.x)/b.w*75),0,75);v->draw();return 0;}
         if(v->pressed>=0&&v->pressed<(int)v->hits.size()&&v->hits[v->pressed].kind==2&&(std::abs(GET_X_LPARAM(lp)-v->down.x)>GetSystemMetrics(SM_CXDRAG)||std::abs(GET_Y_LPARAM(lp)-v->down.y)>GetSystemMetrics(SM_CYDRAG))){auto path=v->hits[v->pressed].path;v->pressed=-1;ReleaseCapture();v->dragFile(path);}return 0;}
     case WM_MOUSELEAVE:v->tracking=false;v->musicOver=false;v->hover=-1;v->draw();return 0;
-    case WM_LBUTTONDOWN:{if(!v->arranging&&v->widgetAt(GET_X_LPARAM(lp)/v->scale,GET_Y_LPARAM(lp)/v->scale)==View::Spectrum)return 0;SetForegroundWindow(v->parent->owner);if(v->animation&&GetTickCount64()-v->animation<620)return 0;v->down={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};v->pressed=-1;float x=v->down.x/v->scale,y=v->down.y/v->scale;if(v->arranging){int toolbar=v->hitAt(x,y);if(toolbar>=0&&v->hits[toolbar].widget==-2){v->pressed=toolbar;SetCapture(hwnd);return 0;}int handle=v->resizeHandleAt(x,y);if(handle>=0){v->dragHandle=handle;v->resizeStart=v->bounds(v->selectedWidget);v->resizeX=x;v->resizeY=y;SetCapture(hwnd);return 0;}int id=v->widgetAt(x,y);if(id>=0){auto b=v->bounds(id);if(v->closeBox(id).contains(x,y)){v->layout[id].shown=false;v->draw();return 0;}v->selectedWidget=v->dragWidget=id;v->grabX=x-b.x;v->grabY=y-b.y;SetCapture(hwnd);v->draw();}return 0;}
+    case WM_LBUTTONDOWN:{if(!v->arranging&&!v->overlayAt(GET_X_LPARAM(lp)/v->scale,GET_Y_LPARAM(lp)/v->scale)&&v->widgetAt(GET_X_LPARAM(lp)/v->scale,GET_Y_LPARAM(lp)/v->scale)==View::Spectrum)return 0;SetForegroundWindow(v->parent->owner);if(v->animation&&GetTickCount64()-v->animation<620)return 0;v->down={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};v->pressed=-1;float x=v->down.x/v->scale,y=v->down.y/v->scale;if(v->arranging){int toolbar=v->hitAt(x,y);if(toolbar>=0&&v->hits[toolbar].widget==-2){v->pressed=toolbar;SetCapture(hwnd);return 0;}if(v->overlayAt(x,y))return 0;int handle=v->resizeHandleAt(x,y);if(handle>=0){v->dragHandle=handle;v->resizeStart=v->bounds(v->selectedWidget);v->resizeX=x;v->resizeY=y;SetCapture(hwnd);return 0;}int id=v->widgetAt(x,y);if(id>=0){auto b=v->bounds(id);if(v->closeBox(id).contains(x,y)){v->layout[id].shown=false;v->draw();return 0;}v->selectedWidget=v->dragWidget=id;v->grabX=x-b.x;v->grabY=y-b.y;SetCapture(hwnd);v->draw();}return 0;}
         v->pressed=v->hitAt(x,y);if(v->pressed>=0)SetCapture(hwnd);return 0;}
-    case WM_LBUTTONUP:{if(v->dragWidget>=0||v->dragHandle>=0){v->dragWidget=v->dragHandle=-1;ReleaseCapture();v->draw();return 0;}int pressed=v->pressed;v->pressed=-1;ReleaseCapture();if(pressed>=0&&pressed<(int)v->hits.size()){auto start=v->hits[pressed];float x=GET_X_LPARAM(lp)/v->scale,y=GET_Y_LPARAM(lp)/v->scale;if(start.kind==1&&(std::abs(GET_X_LPARAM(lp)-v->down.x)>GetSystemMetrics(SM_CXDRAG)||std::abs(GET_Y_LPARAM(lp)-v->down.y)>GetSystemMetrics(SM_CYDRAG))){for(auto& hit:v->hits)if(hit.kind==1&&v->hitContains(hit,x,y)){v->parent->invoke(DeskReorderApp,std::to_wstring(start.index)+L","+std::to_wstring(hit.index));break;}}else if(start.kind==8){v->parent->invoke(101,std::to_wstring(v->data.media.duration*v->musicRatio(x,y)));v->seekDragging=false;v->draw();}else if((start.kind==6||v->hitContains(start,x,y))&&start.click){health::Hold protection;if(protection)start.click();}}return 0;}
+    case WM_LBUTTONUP:{if(v->dragWidget>=0||v->dragHandle>=0){v->dragWidget=v->dragHandle=-1;ReleaseCapture();v->draw();return 0;}int pressed=v->pressed;v->pressed=-1;ReleaseCapture();if(pressed>=0&&pressed<(int)v->hits.size()){auto start=v->hits[pressed];float x=GET_X_LPARAM(lp)/v->scale,y=GET_Y_LPARAM(lp)/v->scale;if(v->overlayAt(x,y)&&start.widget!=-2){v->seekDragging=false;return 0;}if(start.kind==1&&(std::abs(GET_X_LPARAM(lp)-v->down.x)>GetSystemMetrics(SM_CXDRAG)||std::abs(GET_Y_LPARAM(lp)-v->down.y)>GetSystemMetrics(SM_CYDRAG))){for(auto& hit:v->hits)if(hit.kind==1&&v->hitContains(hit,x,y)){v->parent->invoke(DeskReorderApp,std::to_wstring(start.index)+L","+std::to_wstring(hit.index));break;}}else if(start.kind==8){v->parent->invoke(101,std::to_wstring(v->data.media.duration*v->musicRatio(x,y)));v->seekDragging=false;v->draw();}else if((start.kind==6||v->hitContains(start,x,y))&&start.click){health::Hold protection;if(protection)start.click();}}return 0;}
     case WM_CAPTURECHANGED:v->dragWidget=v->dragHandle=-1;v->pressed=-1;v->seekDragging=false;return 0;
-    case WM_LBUTTONDBLCLK:{if(v->arranging)return 0;float x=GET_X_LPARAM(lp)/v->scale,y=GET_Y_LPARAM(lp)/v->scale;for(auto& hit:v->hits)if(hit.kind==2&&v->hitContains(hit,x,y)){openTarget(hit.path);return 0;}return 0;}
+    case WM_LBUTTONDBLCLK:{if(v->arranging)return 0;float x=GET_X_LPARAM(lp)/v->scale,y=GET_Y_LPARAM(lp)/v->scale;if(v->overlayAt(x,y))return 0;for(auto& hit:v->hits)if(hit.kind==2&&v->hitContains(hit,x,y)){openTarget(hit.path);return 0;}return 0;}
     case WM_RBUTTONUP:case WM_CONTEXTMENU:{POINT p;GetCursorPos(&p);v->context(p);return 0;}
-    case WM_MOUSEWHEEL:{if(v->arranging)return 0;POINT p{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};ScreenToClient(hwnd,&p);float x=p.x/v->scale,y=p.y/v->scale;int id=v->widgetAt(x,y);if(id==View::Spectrum)return 0;int delta=GET_WHEEL_DELTA_WPARAM(wp)>0?-1:1;if(id==View::Apps)v->appPage=std::clamp(v->appPage+delta,0,std::max(0,((int)v->data.pinned.size()-1)/v->appsPerPage));else if(id==View::Files)v->filePage=std::clamp(v->filePage+delta,0,std::max(0,((int)v->catalog->files.size()-1)/21));else if(id==View::Windows&&v->data.tasks)v->taskPage=std::clamp(v->taskPage+delta,0,std::max(0,((int)v->data.tasks->groups.size()-1)/9));else if(id==View::Controls){auto b=v->bounds(View::Controls);if(x>=b.x+180&&x<b.x+224)v->parent->invoke(DeskVolume,std::to_wstring(delta<0?3:-3));}v->draw();return 0;}
+    case WM_MOUSEWHEEL:{if(v->arranging)return 0;POINT p{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};ScreenToClient(hwnd,&p);float x=p.x/v->scale,y=p.y/v->scale;if(v->overlayAt(x,y))return 0;int id=v->widgetAt(x,y);if(id==View::Spectrum)return 0;int delta=GET_WHEEL_DELTA_WPARAM(wp)>0?-1:1;if(id==View::Apps)v->appPage=std::clamp(v->appPage+delta,0,std::max(0,((int)v->data.pinned.size()-1)/v->appsPerPage));else if(id==View::Files)v->filePage=std::clamp(v->filePage+delta,0,std::max(0,((int)v->catalog->files.size()-1)/21));else if(id==View::Windows&&v->data.tasks)v->taskPage=std::clamp(v->taskPage+delta,0,std::max(0,((int)v->data.tasks->groups.size()-1)/9));else if(id==View::Controls){auto b=v->bounds(View::Controls);if(x>=b.x+180&&x<b.x+224)v->parent->invoke(DeskVolume,std::to_wstring(delta<0?3:-3));}v->draw();return 0;}
     case WM_KEYDOWN:if(v->arranging){if(wp==VK_ESCAPE)v->finishArrange(false);return 0;}if(wp==VK_ESCAPE&&v->eqSettings){v->eqSettings=false;v->draw();}if(wp==VK_ESCAPE&&v->appearance){v->appearance=false;v->draw();}if(wp==VK_RETURN&&v->page==1&&v->catalog&&v->selectedFile>=0&&v->selectedFile<(int)v->catalog->files.size())openTarget(v->catalog->files[v->selectedFile].path);if(wp==VK_F5)v->parent->refresh();if(wp=='F'&&(GetKeyState(VK_CONTROL)&0x8000))v->parent->invoke(DeskSearch);return 0;
     case WM_DROPFILES:{HDROP drop=(HDROP)wp;for(UINT i=0,n=DragQueryFileW(drop,0xffffffff,nullptr,0);i<n;i++){UINT size=DragQueryFileW(drop,i,nullptr,0);std::wstring path(size+1,0);DragQueryFileW(drop,i,path.data(),size+1);path.resize(size);v->parent->addFile(path);}DragFinish(drop);v->page=1;v->draw();return 0;}
     case WM_COMMAND:if(LOWORD(wp)==201&&!v->editing){if(HIWORD(wp)==EN_CHANGE){v->noteDirty=true;SetTimer(hwnd,2,500,nullptr);}if(HIWORD(wp)==EN_KILLFOCUS&&v->noteDirty){KillTimer(hwnd,2);v->parent->invoke(DeskSaveNote,textOf(v->note));v->noteDirty=false;}}if(LOWORD(wp)==202&&HIWORD(wp)==EN_KILLFOCUS&&!v->editing&&!v->data.timerRunning&&!v->data.timerPaused)v->parent->invoke(DeskSetTimer,textOf(v->timer));return 0;
@@ -506,10 +524,10 @@ void Desktop::Impl::rebuild(){
     for(auto rect:monitors){auto view=std::make_unique<View>(this);view->monitor=rect;view->loadLayout();view->imageMedia.start(view->layoutSection);POINT position{rect.left,rect.top};MapWindowPoints(nullptr,host,&position,1);
         auto previous=SetThreadDpiAwarenessContext(GetWindowDpiAwarenessContext(host));
         auto background=snapshot().background;COLORREF color=RGB((background>>16)&255,(background>>8)&255,background&255);
-        view->backdrop=CreateWindowExW(0,BackdropClass,L"",WS_CHILD|WS_CLIPSIBLINGS,position.x,position.y,rect.right-rect.left,rect.bottom-rect.top,host,nullptr,GetModuleHandleW(nullptr),(LPVOID)(UINT_PTR)color);
-        HWND child=CreateWindowExW(WS_EX_CONTROLPARENT,DeskClass,L"Рабочий стол",WS_CHILD|WS_CLIPCHILDREN|WS_CLIPSIBLINGS,position.x,position.y,rect.right-rect.left,rect.bottom-rect.top,host,nullptr,GetModuleHandleW(nullptr),view.get());
+        view->backdrop=CreateWindowExW(0,BackdropClass,L"",WS_CHILD|WS_CLIPCHILDREN,position.x,position.y,rect.right-rect.left,rect.bottom-rect.top,host,nullptr,GetModuleHandleW(nullptr),(LPVOID)(UINT_PTR)color);
+        HWND child=CreateWindowExW(WS_EX_CONTROLPARENT|WS_EX_NOREDIRECTIONBITMAP,DeskClass,L"Рабочий стол",WS_CHILD|WS_CLIPCHILDREN|WS_CLIPSIBLINGS,position.x,position.y,rect.right-rect.left,rect.bottom-rect.top,host,nullptr,GetModuleHandleW(nullptr),view.get());
         SetThreadDpiAwarenessContext(previous);if(!child)continue;
-        view->data=snapshot();view->resize();view->animation=0;
+        view->engineWallpaper.start(view->layoutSection,rect,wallpaperEngineMonitorIndex(rect),view->backdrop);view->data=snapshot();view->resize();view->animation=0;
         if(view->backdrop){SetWindowPos(view->backdrop,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW|SWP_NOACTIVATE);RedrawWindow(view->backdrop,nullptr,nullptr,RDW_INVALIDATE|RDW_UPDATENOW);}
         SetWindowPos(child,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW|SWP_NOACTIVATE);view->pulse(true);auto key=L"OwnIsland.DesktopView"+std::to_wstring(views.size());SetPropW(owner,key.c_str(),child);views.push_back(std::move(view));
     }
@@ -552,7 +570,7 @@ void Desktop::maintain(){
     HWND native=impl->host?FindWindowExW(impl->host,nullptr,L"SHELLDLL_DefView",nullptr):nullptr;
     bool nativeAbove=false;for(HWND child=impl->host?GetWindow(impl->host,GW_CHILD):nullptr;child;child=GetWindow(child,GW_HWNDNEXT)){if(child==native){nativeAbove=true;break;}wchar_t cls[64]={};GetClassNameW(child,cls,64);if(!wcscmp(cls,DeskClass))break;}
     for(auto& v:impl->views){auto asset=v->imageMedia.snapshot();SetPropW(v->hwnd,L"OwnIsland.ImageFrame",(HANDLE)(UINT_PTR)(asset.image?(asset.image->id&0xfffffff):0));if(nativeAbove&&IsWindow(v->hwnd))SetWindowPos(v->hwnd,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_NOREDRAW);v->pulse();impl->activeAudio|=v->visible&&v->page==0&&v->layout[Impl::View::Spectrum].shown&&v->eqEnabled;}
-    bool anyVisible=false;for(auto& v:impl->views)anyVisible|=v->visible;impl->media.setActive(anyVisible&&data.performance.video);
+    bool anyVisible=false;for(auto& v:impl->views)anyVisible|=v->visible&&!v->engineState.window;impl->media.setActive(anyVisible&&data.performance.video);
     SetPropW(impl->owner,L"OwnIsland.DesktopCount",(HANDLE)(UINT_PTR)impl->views.size());SetPropW(impl->owner,L"OwnIsland.DesktopActive",(HANDLE)(UINT_PTR)(impl->activeAudio?1:0));
 }
 void Desktop::reveal(){if(!impl)return;for(auto& v:impl->views){v->animation=GetTickCount64();v->pulse(true);}}
@@ -560,7 +578,3 @@ bool Desktop::needsAudio()const{return impl&&impl->activeAudio;}
 int Desktop::analysisRate()const{int fps=5;if(impl)for(auto& v:impl->views)if(v->visible&&v->page==0&&v->eqEnabled&&v->layout[Impl::View::Spectrum].shown)fps=std::max(fps,v->eqFPS);return fps;}
 void Desktop::appearance(){if(!impl)return;for(auto& v:impl->views)if(v->visible){v->appearance=true;v->draw();break;}}
 void Desktop::refreshFiles(){if(impl)impl->refresh();}
-
-
-
-

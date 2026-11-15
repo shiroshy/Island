@@ -7,6 +7,7 @@
 #include "file_browser.h"
 #include "native_desktop.h"
 #include "platform.h"
+#include "tray_layout.h"
 #include <shellapi.h>
 #include <shlwapi.h>
 #include <dwmapi.h>
@@ -233,6 +234,7 @@ void ShellPanel::stop(){
 }
 void ShellPanel::maintain(){if(active){
     if(StandaloneMode){if(!nativeTaskbar()){if(!ownTray.hosted())ownTray.start(owner);ownTray.colors(trayColors);ownTray.maintain();}else if(ownTray.hosted()){ownTray.stop();PostMessageW(HWND_BROADCAST,RegisterWindowMessageW(L"TaskbarCreated"),0,0);}}
+    if(overflowAnchored&&!ownTray.hosted())updateOverflow();
     SetPropW(owner,L"OwnIsland.TrayHosted",(HANDLE)(UINT_PTR)(ownTray.hosted()?1:0));SetPropW(owner,L"OwnIsland.TrayCount",(HANDLE)(UINT_PTR)ownTray.count());APPBARDATA data={sizeof(data)};data.hWnd=nativeTaskbar();auto current=data.hWnd?SHAppBarMessage(ABM_GETSTATE,&data):0;if(data.hWnd&&!(current&ABS_AUTOHIDE)){data.lParam=current|ABS_AUTOHIDE;SHAppBarMessage(ABM_SETSTATE,&data);}bars(false);}}
 bool ShellPanel::overflowVisible()const{if(ownTray.hosted())return ownTray.visible();HWND popup=FindWindowW(L"NotifyIconOverflowWindow",nullptr);return popup&&IsWindowVisible(popup);}
 void ShellPanel::monitorOverflowMouse(bool enabled){if(keyThreadId)PostThreadMessageW(keyThreadId,WM_APP+30,enabled,0);}
@@ -252,8 +254,9 @@ void ShellPanel::updateOverflow(){
         overflowAnchored=false;monitorOverflowMouse(false);return;
     }
     if(!overflowAnchored)return;
-    RECT bounds{};GetWindowRect(popup,&bounds);int w=bounds.right-bounds.left,h=bounds.bottom-bounds.top;
     MONITORINFO monitor={sizeof(monitor)};GetMonitorInfoW(MonitorFromPoint(overflowAnchor,MONITOR_DEFAULTTONEAREST),&monitor);
+    if(!contextInteraction())fitNativeTrayOverflow(popup,monitor.rcWork);
+    RECT bounds{};GetWindowRect(popup,&bounds);int w=bounds.right-bounds.left,h=bounds.bottom-bounds.top;
     int x=std::clamp(overflowAnchor.x-w,monitor.rcWork.left,std::max(monitor.rcWork.left,monitor.rcWork.right-w));
     int y=std::clamp(overflowAnchor.y,monitor.rcWork.top,std::max(monitor.rcWork.top,monitor.rcWork.bottom-h));
     if(bounds.left!=x||bounds.top!=y)SetWindowPos(popup,HWND_TOPMOST,x,y,0,0,SWP_NOSIZE|SWP_NOACTIVATE);
@@ -264,8 +267,8 @@ bool ShellPanel::hiddenIcons(POINT anchor){
     if(popup&&IsWindowVisible(popup)){closeOverflow();return true;}
     RECT bounds{};
     if(!sizedOverflow(popup,bounds)){popup=initializeOverflow();if(!sizedOverflow(popup,bounds))return false;}
-    int w=bounds.right-bounds.left,h=bounds.bottom-bounds.top;
     MONITORINFO monitor={sizeof(monitor)};GetMonitorInfoW(MonitorFromPoint(anchor,MONITOR_DEFAULTTONEAREST),&monitor);
+    fitNativeTrayOverflow(popup,monitor.rcWork);GetWindowRect(popup,&bounds);int w=bounds.right-bounds.left,h=bounds.bottom-bounds.top;
     int x=std::clamp(anchor.x-w,monitor.rcWork.left,std::max(monitor.rcWork.left,monitor.rcWork.right-w)),y=std::clamp(anchor.y,monitor.rcWork.top,std::max(monitor.rcWork.top,monitor.rcWork.bottom-h));
     overflowAnchor=anchor;overflowAnchored=true;
     monitorOverflowMouse(true);
