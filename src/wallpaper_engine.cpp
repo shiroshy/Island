@@ -125,9 +125,17 @@ struct EngineWallpaper::Impl {
                 if(owner&&pid==GetProcessId(owner)&&WaitForSingleObject(owner,0)==WAIT_TIMEOUT&&ownedTitle==name)PostMessageW(source,WM_CLOSE,0,0);
                 ownedTitle.clear();
             }if(watch){SetEvent(watch);CloseHandle(watch);watch=nullptr;}if(owner){CloseHandle(owner);owner=nullptr;}source=nullptr;};
-        for(;;){std::wstring exe,path;bool use=false,lookup=false,sync=false;uint64_t generation;
-            {std::unique_lock lock(mutex);wake.wait_for(lock,std::chrono::milliseconds(200));if(stopping)break;exe=executable;path=file;generation=revision;use=active&&state.enabled;lookup=current;current=false;sync=follow&&use&&GetTickCount64()>=poll;}
-            if(generation!=applied||!use){close();std::lock_guard lock(mutex);state.window=nullptr;state.loading=use;applied=generation;attempts=0;retry=0;if(!use&&!lookup)continue;}
+        for(;;){std::wstring exe,path;bool use=false,enabled=false,lookup=false,sync=false;uint64_t generation;
+            {std::unique_lock lock(mutex);wake.wait_for(lock,std::chrono::milliseconds(100));if(stopping)break;exe=executable;path=file;generation=revision;enabled=state.enabled;use=active&&enabled;lookup=current;current=false;sync=follow&&use&&GetTickCount64()>=poll;}
+            if(generation!=applied||!enabled){close();std::lock_guard lock(mutex);state.window=nullptr;state.loading=use;applied=generation;attempts=0;retry=0;}
+            DWORD actualPid=0;wchar_t actualTitle[512]={};if(source){GetWindowThreadProcessId(source,&actualPid);GetWindowTextW(source,actualTitle,512);}
+            if(source&&(!IsWindow(source)||!owner||actualPid!=GetProcessId(owner)||WaitForSingleObject(owner,0)!=WAIT_TIMEOUT||ownedTitle!=actualTitle||GetParent(source)!=anchor)){close();std::lock_guard lock(mutex);state.window=nullptr;}
+            if(source&&(IsIconic(source)!=FALSE)==use){
+                // Preserve this window's decoder/composition resources. Minimization
+                // gives its renderer the native SIZE_MINIMIZED state, without a
+                // global pause command affecting wallpapers on other monitors.
+                ShowWindowAsync(source,use?SW_SHOWNOACTIVATE:SW_SHOWMINNOACTIVE);
+            }
             if(!use&&!lookup)continue;
             if(!engineExecutable(exe)){std::lock_guard lock(mutex);state.loading=false;state.error=L"Не найден Wallpaper Engine";continue;}
             if(lookup||sync){
@@ -138,8 +146,6 @@ struct EngineWallpaper::Impl {
                 if(selected.empty()){if(lookup){state.loading=false;state.error=L"Не удалось получить текущие обои";}continue;}
                 if(lookup||!samePath(selected,file)){file=selected;state.enabled=true;follow=true;state.name=std::filesystem::path(file).parent_path().filename().wstring();state.error.clear();revision++;save();continue;}
             }
-            DWORD actualPid=0;if(source)GetWindowThreadProcessId(source,&actualPid);
-            if(source&&(!IsWindow(source)||!owner||actualPid!=GetProcessId(owner)||WaitForSingleObject(owner,0)!=WAIT_TIMEOUT)){close();std::lock_guard lock(mutex);state.window=nullptr;}
             if(source||GetTickCount64()<retry||attempts>=3)continue;
             attempts++;retry=GetTickCount64()+15000;
             if(!engineProject(path)){std::lock_guard lock(mutex);state.loading=false;state.error=L"Файл обоев недоступен";continue;}

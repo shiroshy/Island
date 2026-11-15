@@ -159,6 +159,7 @@ struct Desktop::Impl::View {
     bool photo=false,wallLoading=false,motion=false,musicOver=false,seekDragging=false;float seekRatio=0;
     std::wstring wallName,wallError;
     ULONGLONG animation=0,lastFrame=0,lastDraw=0,clockTick=0,lastVisibility=0;
+    UINT surfaceWidth=0,surfaceHeight=0;
     std::array<float,48> levels{},peaks{};SpectrumFrame spectrum;
     View(Impl* p):parent(p){std::iota(order.begin(),order.end(),0);}
     ~View(){engineWallpaper.stop();if(IsWindow(hwnd))DestroyWindow(hwnd);if(IsWindow(backdrop))DestroyWindow(backdrop);if(font)DeleteObject(font);if(timerFont)DeleteObject(timerFont);if(brush)DeleteObject(brush);if(noteMask)DeleteObject(noteMask);if(timerMask)DeleteObject(timerMask);}
@@ -246,8 +247,15 @@ void Desktop::Impl::View::imageFitMenu(){POINT p;GetCursorPos(&p);menu=true;int 
 void Desktop::Impl::View::clockCaption(const std::wstring& text,Box b,float size,unsigned color){int align=layout[Clock].captionAlign;if(align<0){label(text,b,size,color);return;}int style=parent->clockStyle;if(style==0||style==1||style==4||style==6||style==7){b.x=14;b.w=1037;}label(text,b,size,color,false,align==0?DWRITE_TEXT_ALIGNMENT_LEADING:align==1?DWRITE_TEXT_ALIGNMENT_CENTER:DWRITE_TEXT_ALIGNMENT_TRAILING);}
 void Desktop::Impl::View::imageWidget(){auto b=baseBounds(Image);if(imageState.image){float pad=layout[Image].background?12:0;gfx->sprite(imageState.image,{b.x+pad,b.y+pad,b.w-2*pad,b.h-2*pad},layout[Image].mediaFit);}else button({b.x+18,b.y+b.h/2-20,b.w-36,40},L"\uE8B9",imageState.loading?L"Загрузка…":L"Выбрать изображение / GIF",[this]{imageMedia.choose(parent->owner);});if(!imageState.error.empty())label(imageState.error,{b.x+18,b.y+b.h-38,b.w-36,28},11,0xe7a29a);}
 void Desktop::Impl::View::resize(){
-    RECT r{};GetClientRect(hwnd,&r);scale=std::max(.35f,std::min((r.right-r.left)/1728.f,(r.bottom-r.top)/972.f));width=r.right/scale;height=r.bottom/scale;left=(width-1600)/2;top=(height-840)/2+4;
-    gfx=std::make_unique<Graphics>();if(!gfx->init(hwnd,r.right,r.bottom,scale,false)){gfx.reset();return;}
+    RECT r{};GetClientRect(hwnd,&r);if(r.right<=0||r.bottom<=0)return;float nextScale=std::max(.35f,std::min(r.right/1728.f,r.bottom/972.f));
+    // Display notifications also arrive when games leave exclusive fullscreen.
+    // Keep the existing composition target and its presented frame when unchanged.
+    if(gfx&&surfaceWidth==(UINT)r.right&&surfaceHeight==(UINT)r.bottom&&scale==nextScale)return;
+    scale=nextScale;width=r.right/scale;height=r.bottom/scale;left=(width-1600)/2;top=(height-840)/2+4;
+    if(gfx&&!gfx->resize(r.right,r.bottom,scale))gfx.reset();
+    if(!gfx){gfx=std::make_unique<Graphics>();if(!gfx->init(hwnd,r.right,r.bottom,scale,false)){gfx.reset();return;}}
+    surfaceWidth=r.right;surfaceHeight=r.bottom;
+    SetPropW(hwnd,L"OwnIsland.SurfaceRevision",(HANDLE)((UINT_PTR)GetPropW(hwnd,L"OwnIsland.SurfaceRevision")+1));
     if(font)DeleteObject(font);if(timerFont)DeleteObject(timerFont);
     font=CreateFontW(-(int)std::lround(15*scale),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,ANTIALIASED_QUALITY,DEFAULT_PITCH,L"Segoe UI");
     timerFont=CreateFontW(-(int)std::lround(51*scale),0,0,0,FW_BOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,ANTIALIASED_QUALITY,DEFAULT_PITCH,L"Bahnschrift");
@@ -451,7 +459,8 @@ void Desktop::Impl::View::draw(){
 }
 void Desktop::Impl::View::pulse(bool force){
     auto stamp=GetTickCount64();data=parent->snapshot();
-    if(force||stamp-lastVisibility>=500){bool now=data.awake&&IsWindowVisible(hwnd)&&!monitorBlocked(monitor)&&exposed(monitor);visible=now;lastVisibility=stamp;SetPropW(hwnd,L"OwnIsland.DesktopPaused",(HANDLE)(UINT_PTR)(visible?0:1));}
+    bool resumed=false;if(force||stamp-lastVisibility>=100){bool now=data.awake&&IsWindowVisible(hwnd)&&!monitorBlocked(monitor)&&exposed(monitor);resumed=now&&!visible;visible=now;lastVisibility=stamp;SetPropW(hwnd,L"OwnIsland.DesktopPaused",(HANDLE)(UINT_PTR)(visible?0:1));}
+    if(resumed){lastFrame=stamp;lastDraw=0;}
     if(awaitingLocalWallpaper){auto local=parent->media.snapshot();if(!local.loading){awaitingLocalWallpaper=false;localWallpaperError=!local.error.empty();if(local.image&&!localWallpaperError)engineWallpaper.disable();}}
     engineWallpaper.setActive(visible&&data.performance.video);if(!visible||!data.performance.video)RemovePropW(hwnd,L"OwnIsland.EngineSource");engineState=engineWallpaper.snapshot();
     if(engineState.window!=lastEngineWindow){lastEngineWindow=engineState.window;if(lastEngineWindow)SetWindowPos(hwnd,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_NOOWNERZORDER);}
@@ -461,7 +470,7 @@ void Desktop::Impl::View::pulse(bool force){
     bool changing=false;for(int i=0;i<48;i++){float target=spectrum.bars[i];float old=levels[i];levels[i]=eqSmooth?levels[i]+(target-levels[i])*(1-std::exp(-dt*(target>levels[i]?25:7))):target;peaks[i]=std::max(levels[i],peaks[i]-dt*.35f);changing|=std::abs(old-levels[i])>.0002f;}
     imageState=imageMedia.snapshot();motion=data.performance.video&&(engineState.enabled||parent->media.snapshot().video||(layout[Image].shown&&imageState.animated));int fps=std::min(data.performance.desktopFPS,eqFPS);int interval=animating?16:motion?1000/data.performance.desktopFPS:changing||spectrum.rms>.00015f?1000/fps:100;if(interval!=timerInterval){timerInterval=interval;SetTimer(hwnd,1,timerInterval,nullptr);}
     auto seconds=stamp/1000;bool tick=clockTick!=seconds;clockTick=seconds;
-    if((force||animating||motion||changing||spectrum.rms>.00015f||tick)&&(force||animating||stamp-lastDraw>=(ULONGLONG)(1000/(motion?data.performance.desktopFPS:fps))))draw();
+    if((force||resumed||animating||motion||changing||spectrum.rms>.00015f||tick)&&(force||resumed||animating||stamp-lastDraw>=(ULONGLONG)(1000/(motion?data.performance.desktopFPS:fps))))draw();
 }
 void Desktop::Impl::View::dragFile(const std::wstring& path){
     PIDLIST_ABSOLUTE id=nullptr;if(FAILED(SHParseDisplayName(path.c_str(),nullptr,&id,0,nullptr)))return;

@@ -2,7 +2,7 @@ name: Windows release
 on:
   push:
     branches: [main]
-    paths: [VERSION]
+    paths: [VERSION, src/**, build.ps1, package.ps1, .github/workflows/release.yml]
   workflow_dispatch:
 permissions:
   contents: write
@@ -28,7 +28,25 @@ jobs:
         run: |
           $version = (Get-Content VERSION -Raw).Trim()
           $archive = "dist/Island-$version-win-x64.zip"
-          gh release create "v$version" $archive "$archive.sha256" --target $env:GITHUB_SHA --title "Island $version" --notes-file RELEASE_NOTES.md --draft
-          if ($LASTEXITCODE -ne 0) { throw 'Release upload failed.' }
+          $tag = "v$version"
+          gh release view $tag --json id 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            $oldTag = git ls-remote --tags origin "refs/tags/$tag"
+            if ($LASTEXITCODE -ne 0 -or -not $oldTag) { throw 'Cannot verify existing release tag.' }
+            $oldSha = ($oldTag -split '\s+')[0]
+            gh release edit $tag --draft=true
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot prepare release replacement.' }
+            gh release upload $tag $archive "$archive.sha256" --clobber
+            if ($LASTEXITCODE -ne 0) { throw 'Replacement upload failed.' }
+            git tag --force $tag $env:GITHUB_SHA
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot prepare updated tag.' }
+            git push origin "refs/tags/$tag" "--force-with-lease=refs/tags/${tag}:$oldSha"
+            if ($LASTEXITCODE -ne 0) { throw 'Release tag changed concurrently.' }
+            gh release edit $tag --title "Island $version" --notes-file RELEASE_NOTES.md
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot update release notes.' }
+          } else {
+            gh release create $tag $archive "$archive.sha256" --target $env:GITHUB_SHA --title "Island $version" --notes-file RELEASE_NOTES.md --draft
+            if ($LASTEXITCODE -ne 0) { throw 'Release upload failed.' }
+          }
           gh release edit "v$version" --draft=false --latest
           if ($LASTEXITCODE -ne 0) { throw 'Release publication failed.' }
