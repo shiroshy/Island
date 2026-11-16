@@ -57,7 +57,8 @@ std::wstring enginePicker(HWND owner,bool executable){
 bool engineProject(const std::wstring& path){if(!engineFile(path)||!std::filesystem::path(path).is_absolute())return false;auto extension=std::filesystem::path(path).extension().wstring();for(auto& c:extension)c=towlower(c);return extension==L".json"||extension==L".pkg"||extension==L".html"||extension==L".htm"||extension==L".mp4"||extension==L".webm"||extension==L".m4v"||extension==L".mov"||extension==L".wmv"||extension==L".avi";}
 struct EngineCommand {bool ok=false;std::wstring output;};
 EngineCommand engineCommand(const std::wstring& exe,const std::wstring& arguments){
-    EngineCommand result;SECURITY_ATTRIBUTES security{sizeof(security),nullptr,TRUE};HANDLE read=nullptr,write=nullptr;if(!CreatePipe(&read,&write,&security,0))return result;SetHandleInformation(read,HANDLE_FLAG_INHERIT,0);
+    EngineCommand result;if(GetSystemMetrics(SM_SHUTTINGDOWN))return result;
+    SECURITY_ATTRIBUTES security{sizeof(security),nullptr,TRUE};HANDLE read=nullptr,write=nullptr;if(!CreatePipe(&read,&write,&security,0))return result;SetHandleInformation(read,HANDLE_FLAG_INHERIT,0);
     // Explicit handle list prevents inheriting unrelated application handles.
     SIZE_T bytes=0;InitializeProcThreadAttributeList(nullptr,1,0,&bytes);std::vector<BYTE> storage(bytes);auto attributes=(LPPROC_THREAD_ATTRIBUTE_LIST)storage.data();
     bool initialized=InitializeProcThreadAttributeList(attributes,1,0,&bytes)!=FALSE;
@@ -88,7 +89,7 @@ std::wstring engineConfigProject(const std::wstring& exe,int index){
     }catch(...){}return {};
 }
 std::wstring currentEngineProject(const std::wstring& exe,int index){auto answer=engineCommand(exe,L"-control getWallpaper -monitor "+std::to_wstring(index));return answer.ok&&engineProject(answer.output)?answer.output:engineConfigProject(exe,index);}
-void launchEngine(const std::wstring& exe){STARTUPINFOW si{sizeof(si)};si.dwFlags=STARTF_USESHOWWINDOW;si.wShowWindow=SW_HIDE;PROCESS_INFORMATION p{};auto command=engineQuote(exe);auto cwd=std::filesystem::path(exe).parent_path().wstring();if(CreateProcessW(exe.c_str(),command.data(),nullptr,nullptr,FALSE,0,nullptr,cwd.c_str(),&si,&p)){CloseHandle(p.hThread);CloseHandle(p.hProcess);}}
+void launchEngine(const std::wstring& exe){if(GetSystemMetrics(SM_SHUTTINGDOWN))return;STARTUPINFOW si{sizeof(si)};si.dwFlags=STARTF_USESHOWWINDOW;si.wShowWindow=SW_HIDE;PROCESS_INFORMATION p{};auto command=engineQuote(exe);auto cwd=std::filesystem::path(exe).parent_path().wstring();if(CreateProcessW(exe.c_str(),command.data(),nullptr,nullptr,FALSE,0,nullptr,cwd.c_str(),&si,&p)){CloseHandle(p.hThread);CloseHandle(p.hProcess);}}
 HWND engineWindow(const std::wstring& exe,const std::wstring& title){struct Find{const std::wstring& exe;const std::wstring& title;HWND result=nullptr;} find{exe,title};EnumWindows([](HWND w,LPARAM p)->BOOL{auto& f=*(Find*)p;wchar_t name[512]={};GetWindowTextW(w,name,512);if(f.title!=name)return TRUE;DWORD pid=0;GetWindowThreadProcessId(w,&pid);if(!engineRendererPath(processPath(pid),f.exe))return TRUE;f.result=w;return FALSE;},(LPARAM)&find);return find.result;}
 HANDLE engineWatch(HWND source,HANDLE sourceProcess,const std::wstring& title,const std::wstring& controller){
     SECURITY_ATTRIBUTES security{sizeof(security),nullptr,TRUE};HANDLE parent=OpenProcess(SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION,TRUE,GetCurrentProcessId()),engine=nullptr;

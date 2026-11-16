@@ -138,6 +138,8 @@ struct DesktopHost {
         if(m==WM_APP+13){self->desktop.maintain();return 0;}
         if(m==WM_DISPLAYCHANGE||m==WM_DPICHANGED){self->desktop.displayChanged();return 0;}
         if(m==WM_APP+5)return 0;
+        if(m==WM_QUERYENDSESSION)return !fileOperationsActive();
+        if(m==WM_ENDSESSION){if(a){health::stopping(true);self->stopping=true;DestroyWindow(w);}return 0;}
         if(m==WM_CLOSE){if(!self->settingsPending)self->stopping=true;return 0;}
         if(m==WM_DESTROY){self->desktop.stop();KillTimer(w,1);PostQuitMessage(0);return 0;}
         return DefWindowProcW(w,m,a,b);

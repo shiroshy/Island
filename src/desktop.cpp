@@ -536,6 +536,7 @@ LRESULT CALLBACK Desktop::Impl::proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     return DefWindowProcW(hwnd,msg,wp,lp);
 }
 void Desktop::Impl::rebuild(){
+    if(!StandaloneMode&&!nativeDesktopCanAttach())return;
     if(rebuilding)return;auto newHost=StandaloneMode?(IsWindow(host)?host:createIndependentHost()):desktopHost();if(!newHost)return;rebuilding=true;auto oldViews=std::move(views);if(retiringViews.empty())retiringViews=std::move(oldViews);host=newHost;
     std::vector<RECT> monitors;EnumDisplayMonitors(nullptr,nullptr,[](HMONITOR,HDC,LPRECT r,LPARAM p)->BOOL{((std::vector<RECT>*)p)->push_back(*r);return TRUE;},(LPARAM)&monitors);
     for(auto rect:monitors){auto view=std::make_unique<View>(this);view->monitor=rect;view->loadLayout();view->imageMedia.start(view->layoutSection);POINT position{rect.left,rect.top};MapWindowPoints(nullptr,host,&position,1);
@@ -573,6 +574,7 @@ void Desktop::start(HWND owner,AudioMeter* audio,std::function<DesktopData()> sn
 void Desktop::stop(){if(impl){HWND owner=impl->owner;size_t count=impl->views.size();impl->stop();for(size_t i=0;i<count;i++){auto key=L"OwnIsland.DesktopView"+std::to_wstring(i);RemovePropW(owner,key.c_str());}RemovePropW(owner,L"OwnIsland.DesktopCount");RemovePropW(owner,L"OwnIsland.DesktopActive");impl.reset();}}
 void Desktop::displayChanged(){if(impl)impl->displayDirty=true;}
 void Desktop::maintain(){
+    if(impl&&!StandaloneMode&&!nativeDesktopCanAttach()){RemovePropW(impl->owner,L"OwnIsland.DesktopReady");return;}
     if(!impl)return;HWND host=StandaloneMode?(IsWindow(impl->host)?impl->host:nullptr):desktopHost();std::vector<RECT> monitors;EnumDisplayMonitors(nullptr,nullptr,[](HMONITOR,HDC,LPRECT r,LPARAM p)->BOOL{((std::vector<RECT>*)p)->push_back(*r);return TRUE;},(LPARAM)&monitors);
     bool rebuild=host!=impl->host||monitors.size()!=impl->views.size();for(size_t i=0;i<impl->views.size();i++)if(!IsWindow(impl->views[i]->hwnd)||i>=monitors.size()||!EqualRect(&monitors[i],&impl->views[i]->monitor))rebuild=true;
     if(impl->displayDirty&&!rebuild){for(auto& v:impl->views)v->resize();impl->displayDirty=false;}

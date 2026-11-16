@@ -6,6 +6,7 @@
 #include <string>
 // Called only after our opaque surfaces cover every monitor.
 bool nativeDesktopTakeover(HWND host);
+bool nativeDesktopCanAttach();
 void nativeDesktopRelease();
 // Also called by the independent shell watchdog after the main process exits.
 void nativeDesktopRecover(const std::wstring& recoveryFile);

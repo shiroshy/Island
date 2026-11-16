@@ -7,6 +7,7 @@
 #include <thread>
 #include <atomic>
 #include "tray.h"
+#include "taskbar_visibility.h"
 
 // State machine is separate from input injection so combinations can be tested locally.
 struct WinKeyState {
@@ -38,6 +39,8 @@ class ShellPanel {
     HWND owner=nullptr;
     std::wstring state;
     bool active=false;
+    taskbar_visibility::Gate taskbarGate;
+    taskbar_visibility::Generation controlledTaskbar;
     HWINEVENTHOOK showHook=nullptr;
     HWINEVENTHOOK overflowHook=nullptr;
     POINT overflowAnchor{};

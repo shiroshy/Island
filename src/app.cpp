@@ -1175,7 +1175,7 @@ public:
             if(wp==PBT_APMSUSPEND){systemSuspended=true;shell.closeOverflow();refreshVisibility();desktop.maintain();updateFrames();return TRUE;}
             if(wp==PBT_APMRESUMEAUTOMATIC||wp==PBT_APMRESUMESUSPEND){systemSuspended=false;audio.restart();tasks.refresh();refreshVisibility(true);desktop.maintain();updateFrames();SetTimer(hwnd,6,300,nullptr);return TRUE;}
             if(wp==PBT_POWERSETTINGCHANGE){auto change=(POWERBROADCAST_SETTING*)lp;if(change&&IsEqualGUID(change->PowerSetting,GUID_CONSOLE_DISPLAY_STATE)&&change->DataLength==sizeof(DWORD)){DWORD state;memcpy(&state,change->Data,sizeof(state));displayActive=state!=0;refreshVisibility(true);desktop.maintain();updateFrames();}}return TRUE;
-        case WM_SETTINGCHANGE:SetTimer(hwnd,6,300,nullptr);draw();return 0;
+        case WM_SETTINGCHANGE:if(wp==SPI_SETWORKAREA){position();return 0;}SetTimer(hwnd,6,300,nullptr);draw();return 0;
         case TrayMessage:if(lp==WM_RBUTTONUP)trayMenu();if(lp==WM_LBUTTONUP){pinned=!expanded;animate(!expanded);}return 0;
         case ExternalCommand:
 #ifdef ISLAND_INTERNAL_SETTINGS
@@ -1191,7 +1191,7 @@ public:
             if(fileOperationsActive()){ShutdownBlockReasonCreate(hwnd,L"Выполняется операция с файлами");return FALSE;}
             ShutdownBlockReasonDestroy(hwnd);storeEdit();health::stopping(true);return TRUE;
         case WM_ENDSESSION:
-            if(wp){health::stopping(true);WritePrivateProfileStringW(L"shell",L"shutdown",L"1",(stateDirectory()+L"\\shell-restore.ini").c_str());storeEdit();}
+            if(wp){health::stopping(true);WritePrivateProfileStringW(L"shell",L"shutdown",L"1",(stateDirectory()+L"\\shell-restore.ini").c_str());storeEdit();shell.stop();stopShellProtection();}
             else{ShutdownBlockReasonDestroy(hwnd);health::stopping(false);}return 0;
         case WM_SYSCOMMAND:if((wp&0xfff0)==SC_CLOSE)return 0;break;
         case island_settings::QueuedAction:{std::unique_ptr<island_settings::Packet> packet((island_settings::Packet*)lp);try{if(packet)nativeSetting(*packet);}catch(...){dialog=false;showToast(L"Не удалось изменить настройку");}nativeSettingsBusy=false;return 0;}
@@ -1380,6 +1380,3 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
     stopShellProtection();
     OleUninitialize();CoUninitialize();return 0;
 }
-
-
-

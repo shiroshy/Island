@@ -9,6 +9,7 @@
 #include <vector>
 #include <algorithm>
 #include "native_desktop.h"
+#include "taskbar_visibility.h"
 
 // Kept separate from Island's graphics, media and WinRT imports deliberately.
 namespace {
@@ -98,24 +99,8 @@ void restoreOrphan() {
         if (pid && !alive(pid) && (GetPrivateProfileIntW(L"shell",L"armed",0,file.c_str())||GetPrivateProfileIntW(L"native-desktop",L"count",0,file.c_str()))) {
             nativeDesktopRecover(file);
             if (GetPrivateProfileIntW(L"shell", L"armed", 0, file.c_str())) {
-                if (GetPrivateProfileIntW(L"shell", L"had-taskbar", 1, file.c_str())) {
-                    APPBARDATA data{sizeof(data)};
-                    data.hWnd = nativeBar();
-                    data.lParam = GetPrivateProfileIntW(L"shell", L"state", ABS_ALWAYSONTOP, file.c_str());
-                    if (data.hWnd)
-                        SHAppBarMessage(ABM_SETSTATE, &data);
-                    BOOL show = GetPrivateProfileIntW(L"shell", L"visible", 1, file.c_str());
-                    EnumWindows(
-                        [](HWND w, LPARAM show) -> BOOL {
-                            wchar_t cls[64];
-                            GetClassNameW(w, cls, 64);
-                            if ((!wcscmp(cls, L"Shell_TrayWnd") || !wcscmp(cls, L"Shell_SecondaryTrayWnd")) &&
-                                !GetPropW(w, L"OwnIsland.TrayEndpoint"))
-                                ShowWindow(w, show ? SW_SHOWNOACTIVATE : SW_HIDE);
-                            return TRUE;
-                        },
-                        show);
-                }
+                taskbar_visibility::rememberLegacy(file);
+                taskbar_visibility::restore(file);
                 WritePrivateProfileStringW(L"shell", L"armed", L"0", file.c_str());
             }
             log(L"restored-orphan", 0, pid);

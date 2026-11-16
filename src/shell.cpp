@@ -98,14 +98,11 @@ struct RestoreLock {
 int read(const std::wstring& file,const wchar_t* key,int fallback=0){return GetPrivateProfileIntW(L"shell",key,fallback,file.c_str());}
 bool write(const std::wstring& file,const wchar_t* key,int value){return WritePrivateProfileStringW(L"shell",key,std::to_wstring(value).c_str(),file.c_str())!=FALSE;}
 HWND nativeTaskbar(){HWND found=nullptr;EnumWindows([](HWND w,LPARAM p)->BOOL{wchar_t cls[64]={};GetClassNameW(w,cls,64);if(!wcscmp(cls,L"Shell_TrayWnd")&&!isIslandTrayEndpoint(w)){*(HWND*)p=w;return FALSE;}return TRUE;},(LPARAM)&found);return found;}
-void bars(bool visible){
-    EnumWindows([](HWND hwnd,LPARAM show)->BOOL{wchar_t cls[100]={};GetClassNameW(hwnd,cls,100);if((!wcscmp(cls,L"Shell_TrayWnd")||!wcscmp(cls,L"Shell_SecondaryTrayWnd"))&&!isIslandTrayEndpoint(hwnd)&&((IsWindowVisible(hwnd)!=FALSE)!=(show!=0)))ShowWindowAsync(hwnd,show?SW_SHOWNOACTIVATE:SW_HIDE);return TRUE;},visible);
-}
 void restore(const std::wstring& file){
     nativeDesktopRecover(file);
     if(!read(file,L"armed"))return;
-    APPBARDATA data={sizeof(data)};data.hWnd=nativeTaskbar();data.lParam=read(file,L"state",ABS_ALWAYSONTOP);
-    if(read(file,L"had-taskbar",1)){SHAppBarMessage(ABM_SETSTATE,&data);bars(read(file,L"visible",1)!=0);}
+    taskbar_visibility::rememberLegacy(file);
+    taskbar_visibility::restore(file);
     write(file,L"armed",0);
 }
 void recoveryLog(const wchar_t* stage,DWORD pid){
@@ -190,9 +187,9 @@ bool startShellProtection(){
     auto state=stateFile();
     RestoreLock lock;
     if(read(state,L"armed")&&!processAlive((DWORD)read(state,L"pid")))restore(state);
-    APPBARDATA data={sizeof(data)};data.hWnd=nativeTaskbar();
-    if(!data.hWnd&&!StandaloneMode)return false;
-    if(!write(state,L"pid",(int)GetCurrentProcessId())||!write(state,L"state",(int)SHAppBarMessage(ABM_GETSTATE,&data))||!write(state,L"visible",IsWindowVisible(data.hWnd))||!write(state,L"had-taskbar",data.hWnd?1:0)||!write(state,L"standalone",StandaloneMode?1:0)||!write(state,L"shutdown",0))return false;
+    if(!nativeTaskbar()&&!StandaloneMode)return false;
+    taskbar_visibility::rememberLegacy(state);
+    if(!write(state,L"pid",(int)GetCurrentProcessId())||!write(state,L"had-taskbar",0)||!write(state,L"standalone",StandaloneMode?1:0)||!write(state,L"shutdown",0)||!WritePrivateProfileStringW(L"shell",L"taskbar-policy",L"visibility-v1",state.c_str()))return false;
     auto eventName=L"Local\\OwnIsland.ShellReady."+std::to_wstring(GetCurrentProcessId());HANDLE ready=CreateEventW(nullptr,TRUE,FALSE,eventName.c_str());
     wchar_t path[32768]={};GetModuleFileNameW(nullptr,path,32768);std::wstring command=L"\""+std::wstring(path)+L"\" --shell-watch "+std::to_wstring(GetCurrentProcessId())+runtimeArguments();
     STARTUPINFOW start={sizeof(start)};start.dwFlags=STARTF_USESHOWWINDOW;start.wShowWindow=SW_HIDE;PROCESS_INFORMATION child={};
@@ -217,8 +214,7 @@ bool ShellPanel::start(HWND target){
     bool keyReady=WaitForSingleObject(keyReadyEvent,3000)==WAIT_OBJECT_0;
     if(!keyReady||!keyInstalled){stop();return false;}
     if(!startShellProtection()){stop();return false;}
-    APPBARDATA data={sizeof(data)};data.hWnd=nativeTaskbar();
-    write(state,L"armed",1);active=true;if(data.hWnd){data.lParam=read(state,L"state")|ABS_AUTOHIDE;SHAppBarMessage(ABM_SETSTATE,&data);}
+    if(!write(state,L"armed",1)){stop();return false;}active=true;
     shellOwner=owner;showHook=SetWinEventHook(EVENT_OBJECT_SHOW,EVENT_OBJECT_SHOW,nullptr,shellShown,0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);
     overflowObserved=FindWindowW(L"NotifyIconOverflowWindow",nullptr);overflowPending=false;
     overflowHook=SetWinEventHook(EVENT_OBJECT_DESTROY,EVENT_OBJECT_LOCATIONCHANGE,nullptr,overflowChanged,0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);
@@ -235,7 +231,16 @@ void ShellPanel::stop(){
 void ShellPanel::maintain(){if(active){
     if(StandaloneMode){if(!nativeTaskbar()){if(!ownTray.hosted())ownTray.start(owner);ownTray.colors(trayColors);ownTray.maintain();}else if(ownTray.hosted()){ownTray.stop();PostMessageW(HWND_BROADCAST,RegisterWindowMessageW(L"TaskbarCreated"),0,0);}}
     if(overflowAnchored&&!ownTray.hosted())updateOverflow();
-    SetPropW(owner,L"OwnIsland.TrayHosted",(HANDLE)(UINT_PTR)(ownTray.hosted()?1:0));SetPropW(owner,L"OwnIsland.TrayCount",(HANDLE)(UINT_PTR)ownTray.count());APPBARDATA data={sizeof(data)};data.hWnd=nativeTaskbar();auto current=data.hWnd?SHAppBarMessage(ABM_GETSTATE,&data):0;if(data.hWnd&&!(current&ABS_AUTOHIDE)){data.lParam=current|ABS_AUTOHIDE;SHAppBarMessage(ABM_SETSTATE,&data);}bars(false);}}
+    SetPropW(owner,L"OwnIsland.TrayHosted",(HANDLE)(UINT_PTR)(ownTray.hosted()?1:0));SetPropW(owner,L"OwnIsland.TrayCount",(HANDLE)(UINT_PTR)ownTray.count());
+    bool legacy=read(state,L"legacy-visibility-pending")!=0;auto probe=taskbar_visibility::probe(legacy);auto previous=taskbarGate.generation;
+    bool ready=taskbarGate.update(probe,GetTickCount64());
+    if(!(previous==probe.generation))taskbar_visibility::log(state,L"observe",probe.generation);
+    SetPropW(owner,L"OwnIsland.ExplorerReady",(HANDLE)(UINT_PTR)(ready?1:0));
+    if(ready){RestoreLock lock;if((DWORD)read(state,L"pid")!=GetCurrentProcessId())return;
+        if(!(controlledTaskbar==probe.generation)){taskbar_visibility::restore(state);controlledTaskbar=probe.generation;taskbar_visibility::log(state,L"visibility-ready",controlledTaskbar);}
+        if(taskbar_visibility::hide(state,controlledTaskbar,GetCurrentProcessId(),legacy)){if(legacy)write(state,L"legacy-visibility-pending",0);}
+    }
+}}
 bool ShellPanel::overflowVisible()const{if(ownTray.hosted())return ownTray.visible();HWND popup=FindWindowW(L"NotifyIconOverflowWindow",nullptr);return popup&&IsWindowVisible(popup);}
 void ShellPanel::monitorOverflowMouse(bool enabled){if(keyThreadId)PostThreadMessageW(keyThreadId,WM_APP+30,enabled,0);}
 bool ShellPanel::contextInteraction()const{return ownTray.contextInteraction()||trayContextUntil>GetTickCount64();}

@@ -42,7 +42,15 @@ void nativeDesktopRecover(const std::wstring& recoveryFile){
     for(int i=0;i<count;i++){wchar_t text[200]={};GetPrivateProfileStringW(section,key(i).c_str(),L"",text,200,recoveryFile.c_str());Record r;if(decode(text,r))restoreRecord(r);}
     WritePrivateProfileStringW(section,nullptr,nullptr,recoveryFile.c_str());
 }
+bool nativeDesktopCanAttach(){
+    // An absent shell is also used by isolated fixtures; there is nothing native
+    // to take over there. Production attachment still needs an existing host.
+    if(!GetShellWindow())return true;
+    HWND panel=FindWindowW(L"OwnIsland.Surface",nullptr);DWORD pid=0;GetWindowThreadProcessId(panel,&pid);
+    return panel&&pid==(ProtectionOwner?ProtectionOwner:GetCurrentProcessId())&&GetPropW(panel,L"OwnIsland.ExplorerReady");
+}
 bool nativeDesktopTakeover(HWND host){
+    if(!nativeDesktopCanAttach())return false;
     HWND window=host?FindWindowExW(host,nullptr,L"SHELLDLL_DefView",nullptr):nullptr;
     if(!window||!desktopView(window))return false;
     DWORD shell=0,pid=0;GetWindowThreadProcessId(GetShellWindow(),&shell);GetWindowThreadProcessId(window,&pid);if(!shell||pid!=shell)return false;
