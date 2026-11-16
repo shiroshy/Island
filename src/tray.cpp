@@ -731,5 +731,27 @@ void TrayHost::maintain() {
     }
   }
 }
-
-
+bool traySelfTest() {
+  std::array<unsigned char, 964> bytes{};
+  auto set = [&](int n, DWORD v) { memcpy(bytes.data() + n, &v, 4); };
+  HWND client =
+      CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr,
+                      GetModuleHandleW(nullptr), nullptr);
+  set(0, Signature);
+  set(4, NIM_ADD);
+  set(8, 956);
+  set(12, (DWORD)(UINT_PTR)client);
+  set(16, 37);
+  set(20, NIF_TIP);
+  memcpy(bytes.data() + 32, L"fixture", 16);
+  COPYDATASTRUCT d{1, (DWORD)bytes.size(), bytes.data()};
+  Wire w;
+  bool ok = decode(d, w) && w.id == 37 && w.tip == L"fixture";
+  d.cbData = 31;
+  ok &= !decode(d, w);
+  d.cbData = (DWORD)bytes.size();
+  set(4, 99);
+  ok &= !decode(d, w);
+  DestroyWindow(client);
+  return ok;
+}

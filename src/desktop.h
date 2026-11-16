@@ -6,6 +6,7 @@
 #include "audio.h"
 #include "performance.h"
 #include "network.h"
+#include "settings_catalog.h"
 #include <functional>
 
 struct DesktopData {
@@ -23,7 +24,7 @@ struct DesktopData {
 };
 enum DesktopAction {DeskSearch=1,DeskApps,DeskAddApp,DeskSettings,DeskWeather,DeskNote,DeskTimerToggle,DeskTimerReset,DeskSaveNote,DeskPinApp,DeskUnpinApp,DeskReorderApp,DeskVolume,DeskToggleMute,DeskSetTimer,DeskAppearance};
 class Desktop {
-
+    friend bool desktopSelfTest();
     struct Impl;
     std::unique_ptr<Impl> impl;
 public:
@@ -38,5 +39,6 @@ public:
     int analysisRate()const;
     void refreshFiles();
     void appearance();
+    bool setting(const island_settings::Packet& packet);
 };
-
+bool desktopSelfTest();

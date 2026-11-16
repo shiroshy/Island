@@ -15,5 +15,5 @@ public:
     void colors(MenuColors colors);
     unsigned count()const;
 };
-
+bool traySelfTest();
 bool isIslandTrayEndpoint(HWND window);

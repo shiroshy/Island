@@ -9,7 +9,15 @@
 #include <cmath>
 #include <chrono>
 
-bool SpectrumAnalyzer::feed(float sample){samples[cursor]=std::isfinite(sample)?std::clamp(sample,-1.f,1.f):0;cursor=(cursor+1)%samples.size();return ++total>=samples.size()&&total%1024==0;}
+bool SpectrumAnalyzer::feed(float sample){samples[cursor]=std::isfinite(sample)?std::clamp(sample,-1.f,1.f):0;cursor=(cursor+1)%samples.size();return ++total>=samples.size();}
+namespace {
+bool analysisDue(double now,double& next,int rate){
+    double period=1000.0/std::clamp(rate,5,60);
+    if(next>now)return false;
+    if(!next||now-next>2*period)next=now;
+    next+=period;return true;
+}
+}
 SpectrumFrame SpectrumAnalyzer::calculate(unsigned sampleRate)const{
     constexpr size_t N=4096;constexpr float pi=3.14159265359f;SpectrumFrame output;std::array<std::complex<float>,N> fft{};
     for(size_t i=0;i<N;i++){float value=samples[(cursor+i)%N];output.rms+=value*value;fft[i]=value*(.5f-.5f*std::cos(2*pi*i/(N-1)));}
@@ -24,8 +32,12 @@ SpectrumFrame SpectrumAnalyzer::calculate(unsigned sampleRate)const{
     }
     for(size_t i=0;i<128;i++)output.wave[i]=samples[(cursor+N-1024+i*8)%N];return output;
 }
-
-
+bool spectrumSelfTest(){SpectrumAnalyzer readiness;for(int i=0;i<4095;i++)if(readiness.feed(0))return false;if(!readiness.feed(0)||!readiness.feed(0))return false;
+    for(int rate:{5,30,60}){double next=0;int count=0;for(int tick=1;tick<=1000;tick+=12)count+=analysisDue(tick,next,rate);if(std::abs(count-rate)>1)return false;}
+    SpectrumAnalyzer analyzer;for(int i=0;i<8192;i++)analyzer.feed(.5f*std::sin(2*3.14159265359f*1000*i/48000));auto sine=analyzer.calculate(48000);auto peak=std::max_element(sine.bars.begin(),sine.bars.end())-sine.bars.begin();
+    SpectrumAnalyzer silent;for(int i=0;i<4096;i++)silent.feed(0);auto zero=silent.calculate(48000);
+    return peak>=24&&peak<=28&&sine.rms>.34f&&sine.rms<.36f&&*std::max_element(zero.bars.begin(),zero.bars.end())==0;
+}
 
 void AudioMeter::run(){
     CoInitializeEx(nullptr,COINIT_MULTITHREADED);
@@ -42,7 +54,7 @@ void AudioMeter::run(){
         if(SUCCEEDED(hr))hr=client->GetService(__uuidof(IAudioCaptureClient),(void**)capture.put());
         if(SUCCEEDED(hr))hr=client->Start();
         auto currentGeneration=generation.load();ULONGLONG deviceCheck=GetTickCount64();LPWSTR currentId=nullptr;if(output)output->GetId(&currentId);
-        float low=0,mid=0;SpectrumAnalyzer analyzer;ULONGLONG lastSamples=GetTickCount64(),lastAnalysis=0;
+        float low=0,mid=0;SpectrumAnalyzer analyzer;ULONGLONG lastSamples=GetTickCount64();double nextAnalysis=0;int previousRate=0;bool analysisReady=false;
         if(SUCCEEDED(hr)){
             float aLow=1-std::exp(-2*3.14159265f*220/format->nSamplesPerSec);
             float aMid=1-std::exp(-2*3.14159265f*2200/format->nSamplesPerSec);
@@ -67,11 +79,12 @@ void AudioMeter::run(){
                             sample/=std::max<WORD>(1,format->nChannels);
                         }
                         low+=aLow*(sample-low);mid+=aMid*(sample-mid);
-                        if(detailed&&analyzer.feed(sample)&&GetTickCount64()-lastAnalysis>=(ULONGLONG)(1000/analysisRate.load())){lastAnalysis=GetTickCount64();auto frame=analyzer.calculate(format->nSamplesPerSec);std::lock_guard lock(spectrumMutex);spectrumFrame=frame;}
+                        if(detailed)analysisReady=analyzer.feed(sample);
                         float parts[]={low,mid-low,sample-mid};
                         for(int i=0;i<3;i++)energy[i]+=parts[i]*parts[i];
                         ++count;
                     }
+                    if(detailed&&analysisReady){int rate=analysisRate.load();if(rate!=previousRate){previousRate=rate;nextAnalysis=0;}if(analysisDue((double)GetTickCount64(),nextAnalysis,rate)){auto frame=analyzer.calculate(format->nSamplesPerSec);std::lock_guard lock(spectrumMutex);spectrumFrame=frame;}}
                     capture->ReleaseBuffer(frames);hr=capture->GetNextPacketSize(&packet);if(FAILED(hr))break;
                 }
                 for(int i=0;i<3;i++){

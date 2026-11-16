@@ -22,6 +22,7 @@ public:
     bool feed(float sample);
     SpectrumFrame calculate(unsigned sampleRate)const;
 };
+bool spectrumSelfTest();
 
 class AudioMeter {
     std::array<std::atomic<float>,3> bands{};

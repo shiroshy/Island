@@ -32,14 +32,14 @@ struct GifFrames {
     }
 };
 }
-void WidgetImageMedia::start(const std::wstring& id){if(worker.joinable())return;key=id;stopping=false;worker=std::thread([this]{run();});}
+void WidgetImageMedia::start(const std::wstring& id){if(worker.joinable())return;key=id;state.loading=true;stopping=false;worker=std::thread([this]{run();});}
 void WidgetImageMedia::stop(){{std::lock_guard lock(mutex);stopping=true;}wake.notify_all();if(worker.joinable())worker.join();}
 void WidgetImageMedia::choose(HWND owner){wchar_t path[32768]={};OPENFILENAMEW f{sizeof(f)};f.hwndOwner=owner;f.lpstrFile=path;f.nMaxFile=32768;f.lpstrTitle=L"Изображение или GIF";f.lpstrFilter=L"Изображения\0*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp;*.tif;*.tiff\0Все файлы\0*.*\0";f.Flags=OFN_EXPLORER|OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST|OFN_NOCHANGEDIR;if(!GetOpenFileNameW(&f))return;load(path);}
 void WidgetImageMedia::load(const std::wstring& path){{std::lock_guard lock(mutex);request=path;pending=true;++generation;state.loading=!path.empty();state.error.clear();}wake.notify_all();}
 void WidgetImageMedia::clear(){{std::lock_guard lock(mutex);request.clear();pending=true;++generation;state.loading=false;}wake.notify_all();}
 void WidgetImageMedia::setActive(bool value,int maximumFPS){bool changed;{std::lock_guard lock(mutex);maximumFPS=std::clamp(maximumFPS,5,60);changed=active!=value||fps!=maximumFPS;active=value;fps=maximumFPS;}if(changed)wake.notify_all();}
 void WidgetImageMedia::run(){
-    CoInitializeEx(nullptr,COINIT_MULTITHREADED);auto root=stateDirectory(),metadataPath=root+L"\\"+key+L"-image.txt";auto saved=readText(metadataPath);size_t split=saved.find(L'\n');std::wstring oldCache=split==std::wstring::npos?L"":saved.substr(split+1);if(!oldCache.empty()){std::lock_guard lock(mutex);if(!pending){request=oldCache;pending=true;}}
+    CoInitializeEx(nullptr,COINIT_MULTITHREADED);auto root=stateDirectory(),metadataPath=root+L"\\"+key+L"-image.txt";auto saved=readText(metadataPath);size_t split=saved.find(L'\n');std::wstring oldCache=split==std::wstring::npos?L"":saved.substr(split+1);{std::lock_guard lock(mutex);if(!pending){if(!oldCache.empty()){request=oldCache;pending=true;}else state.loading=false;}}
     std::unique_ptr<GifFrames> gif;ULONGLONG due=0,lastPublish=0;uint64_t loaded=0;
     for(;;){std::wstring path;bool load=false;uint64_t revision;int maximum=30;
         {std::unique_lock lock(mutex);if(stopping)break;if(pending){path=request;pending=false;load=true;}else if(!active||!gif||gif->count<2){due=0;wake.wait(lock,[&]{return stopping||pending||(active&&gif&&gif->count>1);});continue;}else{auto now=GetTickCount64();if(!due)due=now+gif->delay;if(now<due){wake.wait_for(lock,std::chrono::milliseconds(due-now),[&]{return stopping||pending||!active;});continue;}}revision=generation;maximum=fps;}
@@ -52,5 +52,4 @@ void WidgetImageMedia::run(){
         bool publish=GetTickCount64()-lastPublish>=(ULONGLONG)(1000/maximum);auto image=gif->next(publish);{std::lock_guard lock(mutex);if(stopping)break;if(!image){state.error=L"Не удалось прочитать кадр GIF";gif.reset();}else if(publish&&active&&generation==loaded){state.image=std::move(image);lastPublish=GetTickCount64();}due=GetTickCount64()+(gif?gif->delay:100);}
     }gif.reset();CoUninitialize();
 }
-
-
+bool widgetImageSelfTest(){std::vector<unsigned char> canvas(16,0),red={0,0,255,255},green={0,128,0,128};composite(canvas,2,2,red,1,1,1,0);composite(canvas,2,2,green,1,1,1,0);return canvas[4]==0&&canvas[5]==128&&canvas[6]==127&&canvas[7]==255&&canvas[11]==0;}

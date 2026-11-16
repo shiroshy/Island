@@ -3,7 +3,6 @@
 
 #include "runtime.h"
 #include <windows.h>
-bool StandaloneMode=false;
 std::wstring StateDirectoryOverride;
 namespace {std::wstring quote(const std::wstring& value){std::wstring out=L"\"";size_t slashes=0;for(auto c:value){if(c==L'\\'){++slashes;continue;}if(c==L'"'){out.append(slashes*2+1,L'\\');out+=c;}else{out.append(slashes,L'\\');out+=c;}slashes=0;}out.append(slashes*2,L'\\');out+=L'"';return out;}}
 std::wstring runtimeArguments(){std::wstring args=StandaloneMode?L" --standalone":L" --integrated";if(!StateDirectoryOverride.empty())args+=L" --state-dir "+quote(StateDirectoryOverride);return args;}

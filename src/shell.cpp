@@ -99,7 +99,7 @@ int read(const std::wstring& file,const wchar_t* key,int fallback=0){return GetP
 bool write(const std::wstring& file,const wchar_t* key,int value){return WritePrivateProfileStringW(L"shell",key,std::to_wstring(value).c_str(),file.c_str())!=FALSE;}
 HWND nativeTaskbar(){HWND found=nullptr;EnumWindows([](HWND w,LPARAM p)->BOOL{wchar_t cls[64]={};GetClassNameW(w,cls,64);if(!wcscmp(cls,L"Shell_TrayWnd")&&!isIslandTrayEndpoint(w)){*(HWND*)p=w;return FALSE;}return TRUE;},(LPARAM)&found);return found;}
 void bars(bool visible){
-    EnumWindows([](HWND hwnd,LPARAM show)->BOOL{wchar_t cls[100]={};GetClassNameW(hwnd,cls,100);if((!wcscmp(cls,L"Shell_TrayWnd")||!wcscmp(cls,L"Shell_SecondaryTrayWnd"))&&!isIslandTrayEndpoint(hwnd)&&((IsWindowVisible(hwnd)!=FALSE)!=(show!=0)))ShowWindow(hwnd,show?SW_SHOWNOACTIVATE:SW_HIDE);return TRUE;},visible);
+    EnumWindows([](HWND hwnd,LPARAM show)->BOOL{wchar_t cls[100]={};GetClassNameW(hwnd,cls,100);if((!wcscmp(cls,L"Shell_TrayWnd")||!wcscmp(cls,L"Shell_SecondaryTrayWnd"))&&!isIslandTrayEndpoint(hwnd)&&((IsWindowVisible(hwnd)!=FALSE)!=(show!=0)))ShowWindowAsync(hwnd,show?SW_SHOWNOACTIVATE:SW_HIDE);return TRUE;},visible);
 }
 void restore(const std::wstring& file){
     nativeDesktopRecover(file);

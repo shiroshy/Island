@@ -58,5 +58,5 @@ bool clipboard(HWND owner, const std::vector<std::wstring> &paths, bool cut);
 std::vector<std::wstring> clipboardPaths(HWND owner, DWORD &effect);
 void properties(HWND owner, const std::vector<std::wstring> &paths);
 void openWith(HWND owner, const std::wstring &path);
-
+bool selfTest();
 } // namespace files

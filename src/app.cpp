@@ -15,10 +15,15 @@
 #include "search.h"
 #include "desktop.h"
 #include "components.h"
+#include "welcome.h"
+#include "startup.h"
 #include "native_desktop.h"
 #include "wallpaper.h"
 #include "wallpaper_engine.h"
 #include "dock.h"
+#include "settings_ui.h"
+#include "settings_catalog.h"
+#include "settings_transport.h"
 #include <wtsapi32.h>
 #include <windowsx.h>
 #include <shellapi.h>
@@ -105,6 +110,8 @@ public:
     Overlay overlay;
     WindowsSearch search;
     DesktopProcess desktop;
+    WelcomeAnimation welcome;
+    bool logonStartup=false;int shellRetries=0,bridgeInterval=16;
     WallpaperMedia panelWallpaper;
     int wallOpacity=65,wallShade=35,wallBlur=8,wallDrag=-1;
     bool desktopEnabled=true;
@@ -130,14 +137,14 @@ public:
     int tab=0,editOwner=-1,hoverIndex=-1,selectedClip=-1;
     int clipOffset=0,fileOffset=0,appOffset=0,taskOffset=0;
     float scale=1,currentW=240,currentH=36,fromW=240,fromH=36,targetW=240,targetH=36;
-    bool expanded=false,pinned=false,tracking=false,clipboardOn=false,manualHidden=false,dialog=false,closing=false,weatherEditing=false;
+    bool expanded=false,pinned=false,tracking=false,clipboardOn=false,manualHidden=false,dialog=false,closing=false,weatherEditing=false,nativeSettingsBusy=false;
     bool hoverBlocked=false;
     bool morphing=false;
     double morphStart=0,tabStart=0,lastFrame=0;
     int tabDirection=1;
     std::array<float,9> headerFrom{};
     double headerStart=0;
-    int refreshRate=60,customTimerSeconds=300,selectedColor=0;
+    int panelFPS=60,refreshRate=60,customTimerSeconds=300,selectedColor=0;
     std::wstring colorValue;
     std::array<float,3> meter{};
     struct ShortcutSlot {Box box;size_t index;};
@@ -278,6 +285,12 @@ public:
         draw();
     }
     void changeTab(int index) {
+#ifndef ISLAND_INTERNAL_SETTINGS
+        if(index==8||index==10||index==13||index==14||index==15){openSystemSettings(index==10?L"Island_SettingsAppearance":index==13?L"Island_SettingsWallpaper":index==15?L"Island_SettingsPerformance":L"Island_SettingsPage");return;}
+#else
+        if(index==10||index==13||index==15){internalSection=index==15?3:index==10&&appearanceDesktop?2:1;internalOffset=0;index=8;}
+        SetPropW(hwnd,L"OwnIsland.Tab",(HANDLE)(UINT_PTR)(index+1));
+#endif
         if(index==tab)return;
         storeEdit();storeTimer();hideEditors();draw();
         for(int i=0;i<9;i++)headerFrom[i]=headerWidth(i);
@@ -308,7 +321,7 @@ public:
         float t=headerStart>0?std::clamp((float)((moment()-headerStart)/.26),0.f,1.f):1;
         float ease=t*t*(3-2*t);return headerStart>0?headerFrom[i]+(tabWidth(i,tab)-headerFrom[i])*ease:tabWidth(i,tab);
     }
-    void updateFrames(){auto wall=panelWallpaper.snapshot();bool motion=performance.video&&wall.enabled&&wall.video&&wallOpacity>0&&wallShade<100;panelWallpaper.setActive(motion&&!manualHidden&&!renderPaused&&displayActive&&sessionActive);bool full=desktop.needsAudio()&&!systemSuspended&&displayActive&&sessionActive;audio.setAnalysisRate(std::min(performance.analysisFPS,desktop.analysisRate()));audio.fullSpectrum(full);audio.enable(full||(!manualHidden&&!renderPaused&&now.available&&now.playing&&(!expanded||morphing)));frames.update(!manualHidden&&!renderPaused&&(morphing||tabStart>0||headerStart>0||motion||(!expanded&&now.available&&now.playing)),motion&&!morphing&&!tabStart&&!headerStart?performance.videoFPS:refreshRate);}
+    void updateFrames(){int interval=welcome.active()?16:desktop.needsAudio()?std::clamp(1000/std::min(performance.analysisFPS,desktop.analysisRate()),16,200):250;if(hwnd&&interval!=bridgeInterval){bridgeInterval=interval;SetPropW(hwnd,L"OwnIsland.BridgeIntervalMs",(HANDLE)(UINT_PTR)interval);SetTimer(hwnd,8,interval,nullptr);}panelWallpaper.setFrameRate(performance.videoFPS);panelFPS=std::clamp((int)GetPrivateProfileIntW(L"performance",L"panel-fps",60,ini.c_str()),10,120);auto wall=panelWallpaper.snapshot();bool motion=performance.video&&wall.enabled&&wall.video&&wallOpacity>0&&wallShade<100;panelWallpaper.setActive(motion&&!manualHidden&&!renderPaused&&displayActive&&sessionActive);bool full=desktop.needsAudio()&&!systemSuspended&&displayActive&&sessionActive;audio.setAnalysisRate(std::min(performance.analysisFPS,desktop.analysisRate()));audio.fullSpectrum(full);audio.enable(full||(!manualHidden&&!renderPaused&&now.available&&now.playing&&(!expanded||morphing)));frames.update(!manualHidden&&!renderPaused&&(morphing||tabStart>0||headerStart>0||motion||(!expanded&&now.available&&now.playing)),motion&&!morphing&&!tabStart&&!headerStart?std::min(performance.videoFPS,panelFPS):std::min(refreshRate,panelFPS));}
     DesktopData desktopData(){
         DesktopData d;d.performance=performance;d.network=network.state();d.media=now;d.weather=weather;d.tasks=taskState;d.pinned=shortcuts;d.note=noteValue;
         d.background=desktopLook.colors[0];d.card=desktopLook.colors[1];d.accent=desktopLook.colors[2];d.ink=desktopLook.colors[3];d.muted=desktopLook.colors[4];d.hover=desktopLook.colors[5];d.outline=desktopLook.colors[6];d.outlineWidth=desktopLook.width;d.outlineSmooth=desktopLook.smooth;
@@ -318,9 +331,10 @@ public:
     void desktopAction(int code,const std::wstring& value){
         if(code==DeskSaveNote){if(value!=noteValue){noteValue=value;writeNote(value);if(edit&&editOwner==5&&editText(edit)!=value)SetWindowTextW(edit,value.c_str());}return;}
         if(closing)return;
-        if(code==DeskAppearance){openAppearance(true);return;}
+        if(code==DeskAppearance){openSystemSettings(L"Island_SettingsDesktopAppearance");return;}
         if(code==DeskSearch){storeEdit();openSearch();return;}
-        if(code==DeskApps||code==DeskSettings||code==DeskWeather||code==DeskNote){storeEdit();pinned=true;animate(true);changeTab(code==DeskApps?11:code==DeskSettings?8:code==DeskWeather?6:5);SetForegroundWindow(hwnd);return;}
+        if(code==DeskSettings){openSystemSettings();return;}
+        if(code==DeskApps||code==DeskWeather||code==DeskNote){storeEdit();pinned=true;animate(true);changeTab(code==DeskApps?11:code==DeskWeather?6:5);SetForegroundWindow(hwnd);return;}
         if(code==DeskAddApp){addShortcut();return;}
         if(code==DeskTimerToggle){if(!timerEnd&&!timerPaused&&!value.empty()){int seconds;if(!parseTimer(value,seconds)){showToast(L"Некорректное время");return;}customTimerSeconds=seconds;}timerAction();return;}
         if(code==DeskSetTimer){int seconds;if(parseTimer(value,seconds)){customTimerSeconds=seconds;timerEnd=timerPaused=0;save();syncEdit();}return;}
@@ -465,13 +479,12 @@ public:
         shell.colors(menuColors());
         gfx->text(timeString(),{508,12,45,27},10.5f,Muted,false,DWRITE_TEXT_ALIGNMENT_CENTER);
         auto iconButton=[&](float px,const wchar_t* glyph,std::function<void()> fn,bool on=false){Box r{px,12,27,27};if(on||hoverIndex==(int)hits.size())gfx->fill(r,Card,8);gfx->icon(glyph,r,13,on?Accent:Muted);addHit(r,[fn](float){fn();},true);};
-        iconButton(472,L"\uE721",[this]{openSearch();},tab==12);
+        iconButton(670,L"\uE721",[this]{openSearch();},tab==12);
         iconButton(555,shell.overflowVisible()?L"\uE70D":L"\uE70E",[this]{auto origin=uiOrigin();POINT p{(LONG)((582+origin.x)*scale),(LONG)((43+origin.y)*scale)};ClientToScreen(hwnd,&p);if(!shell.hiddenIcons(p))showToast(L"Скрытые значки недоступны");draw();});
         iconButton(583,muted||volume<.001f?L"\uE74F":L"\uE767",[this]{toggleMute();muted=getMuted();draw();});
         iconButton(612,L"\uE720",[this]{ShellExecuteW(hwnd,L"open",L"control.exe",L"mmsys.cpl,,1",nullptr,SW_SHOWNORMAL);});
         if(micState!=0){gfx->line(619,31,632,19,Background,3.8f);gfx->line(619,31,632,19,Muted,1.3f);}
         iconButton(641,L"\uE718",[this]{pinned=!pinned;draw();},pinned);
-        iconButton(670,L"\uE713",[this]{changeTab(8);},tab==8||tab==10||tab==13||tab==14||tab==15);
     }
     void mediaCard() {
         Box r{34,51,421,151};gfx->fill(r,Card,12);
@@ -715,26 +728,71 @@ public:
         auto card=[&](float x,const wchar_t* title,const wchar_t* subtitle,const wchar_t* glyph,std::function<void()> fn){Box b{x,55,214,144};gfx->fill(b,hoverIndex==(int)hits.size()?Hover:Card,12);gfx->fill({x+14,69,34,34},0x38453e,17);if(!wcscmp(glyph,L"\uE701")){float cx=x+31,cy=95;for(float radius:{5.f,10.f,15.f})for(int i=0;i<18;i++){float a=(-135+i*5)*3.14159265f/180,b=a+5*3.14159265f/180;gfx->line(cx+radius*std::cos(a),cy+radius*std::sin(a),cx+radius*std::cos(b),cy+radius*std::sin(b),Accent,1.5f);}gfx->fill({cx-1.4f,cy-1.4f,2.8f,2.8f},Accent,1.4f);}else gfx->icon(glyph,{x+14,69,34,34},17,Accent);gfx->text(title,{x+15,131,186,24},14,Ink,true);gfx->text(subtitle,{x+15,160,185,22},10,Muted);addHit(b,[fn](float){fn();});};
         card(34,L"Сеть",network.state()==NetworkKind::Wifi?L"Wi-Fi":network.state()==NetworkKind::Ethernet?L"Ethernet":network.state()==NetworkKind::Disconnected?L"Нет подключения":L"Подключено",networkGlyph(network.state()),[]{openTarget(L"ms-settings:network");});
         card(261,L"Bluetooth",L"Устройства и подключения",L"\uE702",[]{openTarget(L"ms-settings:bluetooth");});
-        card(488,L"Оформление",L"Тема и цвета Windows",L"\uE790",[]{openTarget(L"ms-settings:colors");});
+        card(488,L"Настройки",L"Панель управления, кастомизация",L"\uE713",[]{openSystemSettings();});
         const wchar_t* names[]={L"Блокировка",L"Сон",L"Перезагрузка",L"Выключение"};
         const wchar_t* glyphs[]={L"\uE72E",L"\uE708",L"\uE777",L"\uE7E8"};
         for(int i=0;i<4;i++)button({34.f+i*170,213,158,57},names[i],glyphs[i],[this,i]{powerAction(i);});
         if(!confirmAction.empty() && GetTickCount64()<confirmUntil)gfx->text(L"Нажмите «"+confirmAction+L"» ещё раз для подтверждения",{36,283,660,34},11,0xe5cfa5,false,DWRITE_TEXT_ALIGNMENT_CENTER);
     }
     bool isStartup() {
-        HKEY key;bool on=false;
-        if(RegOpenKeyExW(HKEY_CURRENT_USER,L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",0,KEY_QUERY_VALUE,&key)==ERROR_SUCCESS){on=RegQueryValueExW(key,L"OwnIsland",nullptr,nullptr,nullptr,nullptr)==ERROR_SUCCESS;RegCloseKey(key);}return on;
+        return startup::enabled();
     }
-    void refreshStartupLauncher(){if(!StateDirectoryOverride.empty())return;wchar_t module[32768];GetModuleFileNameW(nullptr,module,32768);auto launcher=std::filesystem::path(module).parent_path()/L"Island.Start.exe";if(!std::filesystem::exists(launcher))return;HKEY key=nullptr;if(RegOpenKeyExW(HKEY_CURRENT_USER,L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",0,KEY_QUERY_VALUE|KEY_SET_VALUE,&key)!=ERROR_SUCCESS)return;wchar_t current[32768]={};DWORD size=sizeof(current),type=0;if(RegQueryValueExW(key,L"OwnIsland",nullptr,&type,(BYTE*)current,&size)==ERROR_SUCCESS&&type==REG_SZ){current[32767]=0;std::wstring expected=L"\""+std::wstring(module)+L"\"";if(!_wcsicmp(current,expected.c_str())||!_wcsicmp(current,module)){auto command=L"\""+launcher.wstring()+L"\"";RegSetValueExW(key,L"OwnIsland",0,REG_SZ,(const BYTE*)command.c_str(),(DWORD)((command.size()+1)*sizeof(wchar_t)));}}RegCloseKey(key);}
+    void refreshStartupLauncher(){if(StateDirectoryOverride.empty())PostMessageW(hwnd,WM_APP+87,0,0);}
     void startupToggle() {
-        bool enabled=isStartup();HKEY key;
-        if(RegCreateKeyExW(HKEY_CURRENT_USER,L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",0,nullptr,0,KEY_SET_VALUE,nullptr,&key,nullptr)!=ERROR_SUCCESS){showToast(L"Не удалось изменить автозапуск");return;}
-        if(enabled)RegDeleteValueW(key,L"OwnIsland");
-        else {wchar_t path[32768];GetModuleFileNameW(nullptr,path,32768);auto starter=std::filesystem::path(path).parent_path()/L"Island.Start.exe";if(std::filesystem::exists(starter))wcscpy_s(path,starter.c_str());std::wstring command=L"\""+std::wstring(path)+L"\"";RegSetValueExW(key,L"OwnIsland",0,REG_SZ,(const BYTE*)command.c_str(),(DWORD)((command.size()+1)*sizeof(wchar_t)));}
-        RegCloseKey(key);draw();
+        if(!StateDirectoryOverride.empty()||!startup::setEnabled(!isStartup()))showToast(L"Не удалось изменить автозапуск");draw();
     }
     MenuColors menuColors()const{return {Background,Hover,Ink,Muted,Accent,Outline,BorderWidth,BorderSmooth};}
+    bool nativeSetting(const island_settings::Packet& p){
+        using island_settings::Id;auto definition=island_settings::find(p.id);if(!definition||!island_settings::valid(p)||closing)return false;
+        health::Hold protection;if(!protection)return false;
+        if(p.action){
+            HWND owner=(HWND)(UINT_PTR)p.owner;if(!island_settings::settingsOwner(owner))owner=hwnd;
+            bool previousDialog=dialog;dialog=true;
+            if(*definition->key&&(!wcscmp(definition->section,L"colors")||!wcscmp(definition->section,L"desktop-colors"))){
+                const wchar_t* keys[]={L"background",L"card",L"accent",L"text",L"secondary",L"hover",L"outline"};int index=0;while(index<7&&wcscmp(keys[index],definition->key))++index;
+                if(index<7){unsigned* colors[]={&Background,&Card,&Accent,&Ink,&Muted,&Hover,&Outline};unsigned& color=!wcscmp(definition->section,L"desktop-colors")?desktopLook.colors[index]:*colors[index];unsigned selected=color;if(chooseSettingsColor(owner,color,Background,Ink,Accent,selected)){color=selected;applyTheme();save();draw();}}
+            }else if(p.id==Id::PanelPhoto||p.id==Id::PanelVideo){panelWallpaper.choose(owner,p.id==Id::PanelVideo);updateFrames();draw();}
+            else if(p.id==Id::PanelClear){panelWallpaper.clear();WritePrivateProfileStringW(L"panel",L"wallpaper-photo",L"0",ini.c_str());updateFrames();draw();}
+            else if(p.id==Id::PerformanceEco||p.id==Id::PerformanceNormal){performance.desktopFPS=p.id==Id::PerformanceEco?15:30;performance.videoFPS=p.id==Id::PerformanceEco?15:30;performance.analysisFPS=p.id==Id::PerformanceEco?10:30;performance.save(ini);updateFrames();draw();}
+            else if(p.id==Id::ThemeDark||p.id==Id::ThemeLight||p.id==Id::ThemeGraphite||p.id==Id::DesktopThemeDark||p.id==Id::DesktopThemeLight||p.id==Id::DesktopThemeGraphite){bool desk=p.id==Id::DesktopThemeDark||p.id==Id::DesktopThemeLight||p.id==Id::DesktopThemeGraphite;int choice=p.id==Id::ThemeLight||p.id==Id::DesktopThemeLight?1:p.id==Id::ThemeGraphite||p.id==Id::DesktopThemeGraphite?2:0;if(p.id==Id::ThemeDark||p.id==Id::DesktopThemeDark)choice=settingsLightTheme()?1:0;unsigned presets[3][7]={{0x09090b,0x252328,0xb8d8c9,0xeae9ed,0x8a8790,0x322f37,0x77717f},{0xf0eff3,0xffffff,0x598d72,0x24212b,0x77717f,0xe0dee6,0x77717f},{0x151a21,0x242c36,0x9db9db,0xe9eef5,0x8c9caf,0x344254,0x77717f}};unsigned* colors[]={&Background,&Card,&Accent,&Ink,&Muted,&Hover,&Outline};for(int i=0;i<7;i++)if(desk)desktopLook.colors[i]=presets[choice][i];else *colors[i]=presets[choice][i];applyTheme();save();draw();}
+            else {dialog=previousDialog;return desktop.setting(p);}
+            dialog=previousDialog;return true;
+        }
+        double value=p.value;if(definition->kind==island_settings::Kind::Range)value=definition->minimum+std::round((value-definition->minimum)/definition->step)*definition->step;
+        if(definition->kind==island_settings::Kind::List){bool allowed=p.id==Id::DesktopMonitor&&value>=0&&value<GetSystemMetrics(SM_CMONITORS)&&std::floor(value)==value;std::wstring values=definition->values;size_t start=0;while(start<values.size()){size_t end=values.find(L'|',start);if(_wtof(values.substr(start,end==std::wstring::npos?values.size()-start:end-start).c_str())==value)allowed=true;if(end==std::wstring::npos)break;start=end+1;}if(!allowed)return false;}
+        switch(p.id){
+        case Id::Startup:if(isStartup()!=(value!=0))startupToggle();return isStartup()==(value!=0);
+        case Id::Hover:settings.hover=value!=0;break;
+        case Id::ShowSeconds:settings.seconds=value!=0;break;
+        case Id::DesktopEnabled:if(desktopEnabled!=(value!=0)){desktopEnabled=value!=0;if(desktopEnabled)startDesktop();else desktop.stop();}break;
+        case Id::DockLocked:dockLocked=value!=0;break;
+        case Id::Size:settings.size=(int)value;break;
+        case Id::WindowsFileManager:setWindowsFileManager(value!=0);return true;
+        case Id::Edge:dockEdge=(int)value;break;
+        case Id::OutlineWidth:BorderWidth=(float)value;break;
+        case Id::OutlineSmooth:BorderSmooth=value!=0;break;
+        case Id::DesktopOutlineWidth:desktopLook.width=(float)value;break;
+        case Id::DesktopOutlineSmooth:desktopLook.smooth=value!=0;break;
+        case Id::PanelOpacity:wallOpacity=(int)value;saveWallpaper();break;
+        case Id::PanelShade:wallShade=(int)value;saveWallpaper();break;
+        case Id::PanelBlur:wallBlur=(int)value;saveWallpaper();break;
+        case Id::VideoEnabled:performance.video=value!=0;performance.save(ini);break;
+        case Id::DesktopFPS:performance.desktopFPS=(int)value;performance.save(ini);break;
+        case Id::PanelFPS:WritePrivateProfileStringW(L"performance",L"panel-fps",std::to_wstring((int)value).c_str(),ini.c_str());updateFrames();return true;
+        case Id::VideoFPS:performance.videoFPS=(int)value;performance.save(ini);break;
+        case Id::AnalysisFPS:performance.analysisFPS=(int)value;performance.save(ini);break;
+        case Id::DesktopMonitor:WritePrivateProfileStringW(L"desktop",L"settings-monitor-explicit",L"1",ini.c_str());WritePrivateProfileStringW(L"desktop",L"settings-monitor",std::to_wstring((int)value).c_str(),ini.c_str());return true;
+        default:{auto packet=p;packet.value=value;return desktop.setting(packet);}
+        }
+        save();applyTheme();if(p.id==Id::Size)position();else if(p.id==Id::Edge){hideEditors();placeDock();region();}else region();updateFrames();draw();return true;
+    }
+#ifdef ISLAND_INTERNAL_SETTINGS
+#include "internal_settings_panel.h"
+#endif
     void settingsPage() {
+#ifdef ISLAND_INTERNAL_SETTINGS
+        internalSettingsPage();return;
+#endif
         auto toggle=[&](float y,const wchar_t* label,bool on,std::function<void()> fn){Box b{34,y,668,26};gfx->text(label,{47,y,580,26},12,Ink);gfx->fill({646,y+3,39,21},on?Accent:mix(Card,Muted,.5f),11);gfx->fill({on?666.f:649.f,y+6,15,15},on?Ink:Muted,8);addHit(b,[fn](float){fn();});};
         toggle(54,L"Запускать вместе с Windows",isStartup(),[this]{startupToggle();});
         toggle(82,L"Раскрывать при наведении",settings.hover,[this]{settings.hover=!settings.hover;save();draw();});
@@ -791,7 +849,7 @@ public:
         for(int i=0;i<7;i++){bool enabled=i!=6||selectedWidth()>0;Box r{34,91.f+i*27,408,25};if(enabled&&(i==selectedColor||hoverIndex==(int)hits.size()))gfx->fill(r,i==selectedColor?Hover:Card,7);gfx->fill({45,r.y+4,17,17},colorAt(i),5);gfx->stroke({45,r.y+4,17,17},Muted,5,.5f);gfx->text(names[i],{75,r.y,207,25},12,enabled?Ink:mix(Card,Muted,.7f));gfx->text(hexColor(colorAt(i)),{302,r.y,123,25},11,Muted,false,DWRITE_TEXT_ALIGNMENT_TRAILING);if(enabled)addHit(r,[this,i](float){storeEdit();selectedColor=i;openColorPicker();});}
         gfx->fill({464,94,238,35},colorAt(selectedColor),9);gfx->text(hexColor(colorAt(selectedColor)),{464,94,238,35},12,contrast(colorAt(selectedColor)),true,DWRITE_TEXT_ALIGNMENT_CENTER);if(selectedColorEnabled())addHit({464,94,238,35},[this](float){openColorPicker();});
         gfx->fill({464,140,238,42},Card,8);ghost(colorValue,{476,140,206,42},false,10);button({464,193,238,33},L"Применить",L"\uE73E",[this]{storeEdit();applyColor();},false,selectedColorEnabled());
-        const wchar_t* presets[]={L"Тёмная",L"Светлая",L"Графит"};for(int i=0;i<3;i++)button({464.f+i*81,238,76,30},presets[i],nullptr,[this,i]{unsigned values[3][6]={{0x09090b,0x252328,0xb8d8c9,0xeae9ed,0x8a8790,0x322f37},{0xf0eff3,0xffffff,0x598d72,0x24212b,0x77717f,0xe0dee6},{0x151a21,0x242c36,0x9db9db,0xe9eef5,0x8c9caf,0x344254}};for(int j=0;j<6;j++)colorAt(j)=values[i][j];colorValue=hexColor(colorAt(selectedColor));if(edit&&editOwner==10)SetWindowTextW(edit,colorValue.c_str());applyTheme();save();draw();});
+        const wchar_t* presets[]={L"Тёмная",L"Светлая",L"Графит"};for(int i=0;i<3;i++)button({464.f+i*81,238,76,30},presets[i],nullptr,[this,i]{unsigned values[3][7]={{0x09090b,0x252328,0xb8d8c9,0xeae9ed,0x8a8790,0x322f37,0x77717f},{0xf0eff3,0xffffff,0x598d72,0x24212b,0x77717f,0xe0dee6,0x77717f},{0x151a21,0x242c36,0x9db9db,0xe9eef5,0x8c9caf,0x344254}};for(int j=0;j<6;j++)colorAt(j)=values[i][j];colorValue=hexColor(colorAt(selectedColor));if(edit&&editOwner==10)SetWindowTextW(edit,colorValue.c_str());applyTheme();save();draw();});
         gfx->text(L"Обводка",{34,286,140,24},12,Ink);gfx->text(decimal(selectedWidth())+L" px",{307,286,94,24},11,Muted,false,DWRITE_TEXT_ALIGNMENT_TRAILING);gfx->fill({183,316,218,3},Hover,1);gfx->fill({183,316,218*selectedWidth()/6,3},Accent,1);gfx->fill({178+218*selectedWidth()/6,312,10,11},Ink,5);addHit({177,306,230,21},[this](float f){styleDrag=1;selectedWidth()=std::clamp(std::round(f*12)/2,0.f,6.f);syncEdit();SetCapture(hwnd);draw();});
         Box check{464,282,238,35};bool outlined=selectedWidth()>0;gfx->stroke({469,291,16,16},outlined&&selectedSmooth()?Accent:Muted,4,1);if(selectedSmooth())gfx->icon(L"\uE73E",{469,291,16,16},11,outlined?Accent:Muted);gfx->text(L"Сглаживание",{495,282,207,35},12,outlined?Ink:Muted);if(outlined)addHit(check,[this](float){selectedSmooth()=!selectedSmooth();save();draw();});
     }
@@ -802,6 +860,10 @@ public:
         float px=34+350*pickerSat,py=98+178*(1-pickerValue);gfx->stroke({px-5,py-5,10,10},0xffffff,5,1.5f);gfx->stroke({px-6.5f,py-6.5f,13,13},0,6.5f,1);gfx->line(397,98+178*pickerHue/360,425,98+178*pickerHue/360,Ink,2);
         addHit({34,98,350,178},[this](float){styleDrag=2;POINT p;GetCursorPos(&p);ScreenToClient(hwnd,&p);auto q=uiPoint(p.x/scale,p.y/scale);stylePointer(q.x,q.y);SetCapture(hwnd);});addHit({396,98,30,178},[this](float){styleDrag=3;POINT p;GetCursorPos(&p);ScreenToClient(hwnd,&p);auto q=uiPoint(p.x/scale,p.y/scale);stylePointer(q.x,q.y);SetCapture(hwnd);});
         unsigned c=0;parseColor(colorValue,c);gfx->fill({464,98,238,49},c,9);gfx->text(colorValue,{464,98,238,49},13,contrast(c),true,DWRITE_TEXT_ALIGNMENT_CENTER);gfx->fill({464,159,238,42},Card,8);ghost(colorValue,{476,159,206,42},false,14);button({464,212,238,33},L"Применить",L"\uE73E",[this]{storeEdit();applyColor();});button({464,257,238,33},L"Отмена",nullptr,[this]{colorValue=hexColor(colorAt(selectedColor));changeTab(10);});
+#ifdef ISLAND_INTERNAL_SETTINGS
+        internalFooter();
+#endif
+
     }
     int searchRows()const{return searchState->indexError?3:4;}
     void openSearch(){searchFocus=true;pinned=true;animate(true);changeTab(12);syncEdit();}
@@ -970,7 +1032,7 @@ public:
         POINT p;GetCursorPos(&p);dialog=true;int result=customMenu(hwnd,p,items,menuColors());dialog=false;
         if(result==1){manualHidden=false;ShowWindow(hwnd,SW_SHOWNOACTIVATE);pinned=!expanded;animate(!expanded);}
         if(result==2){pinned=!pinned;if(pinned)animate(true);}
-        if(result==3){pinned=true;animate(true);changeTab(8);}
+        if(result==3)openSystemSettings();
         if(result==4)openTarget(L"taskmgr.exe");
         if(result==5)toggleDesktop();
         PostMessageW(hwnd,WM_NULL,0,0);
@@ -996,6 +1058,8 @@ public:
         case WM_CREATE:{
             SetPropW(hwnd,L"OwnIsland.Standalone",(HANDLE)(UINT_PTR)(StandaloneMode?1:0));
             load();position();if(!gfx)return -1;
+            if(logonStartup)welcome.start(hwnd);
+            startDesktop();
             tray.cbSize=sizeof(tray);tray.hWnd=hwnd;tray.uID=1;tray.uFlags=NIF_MESSAGE|NIF_ICON|NIF_TIP;tray.uCallbackMessage=TrayMessage;
             tray.hIcon=LoadIconW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(1));if(!tray.hIcon)tray.hIcon=LoadIconW(nullptr,IDI_APPLICATION);
             wcscpy_s(tray.szTip,L"Win");Shell_NotifyIconW(NIM_ADD,&tray);
@@ -1008,8 +1072,7 @@ public:
             network.start();frames.start(hwnd);audio.start();media.start(hwnd);tasks.setPinned(shortcuts);tasks.start(hwnd);
             search.setSources(shortcuts);search.start(hwnd);
             taskHookTarget=hwnd;foregroundHook=SetWinEventHook(EVENT_SYSTEM_FOREGROUND,EVENT_SYSTEM_FOREGROUND,nullptr,foregroundEvent,0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);
-            if(!shell.start(hwnd))showToast(L"Не удалось включить замену панели Windows");else position();
-            startDesktop();
+            if(!shell.start(hwnd))showToast(L"Не удалось включить замену панели Windows");else{SetPropW(hwnd,L"OwnIsland.ShellReady",(HANDLE)1);position();}
             if(!cityValue.empty())requestWeather();lastFrame=moment();return 0;
         }
         case WM_PAINT:{PAINTSTRUCT ps;BeginPaint(hwnd,&ps);EndPaint(hwnd,&ps);draw();return 0;}
@@ -1021,6 +1084,9 @@ public:
             if(renderPaused)return 0;
             POINT currentPointer;GetCursorPos(&currentPointer);if(!expanded&&settings.hover&&!hoverBlocked&&!gripAt(currentPointer))animate(true);
             auto local=uiPoint(GET_X_LPARAM(lp)/scale,GET_Y_LPARAM(lp)/scale);float x=local.x,y=local.y;
+#ifdef ISLAND_INTERNAL_SETTINGS
+            if(internalDragging){internalSliderPointer(x);return 0;}
+#endif
             if(styleDrag){stylePointer(x,y);return 0;}
             if(draggingSeek){seekRatio=std::clamp((x-198)/194,0.f,1.f);draw();return 0;}
             if(wallDrag>=0){wallValue(wallDrag,std::clamp((x-48)/640,0.f,1.f));draw();return 0;}
@@ -1039,10 +1105,21 @@ public:
             for(size_t i=0;i<hits.size();i++)if(hits[i].box.contains(x,y)){if(tabStart>0&&!hits[i].header)break;auto action=hits[i].action;auto box=hits[i].box;health::Hold protection;if(protection)action(std::clamp((x-box.x)/box.w,0.f,1.f));break;}
             return 0;
         }
-        case WM_LBUTTONUP:if(dockPending){bool moved=dockMoving;dockPending=dockMoving=false;ReleaseCapture();if(moved){dockRatio=snapDockRatio(dockRatio);saveDock();position();}else{pinned=true;animate(true);}return 0;}if(styleDrag){styleDrag=0;ReleaseCapture();save();region();draw();}if(draggingSeek){draggingSeek=false;ReleaseCapture();if(now.duration>0)media.seek(seekRatio*now.duration);draw();}if(wallDrag>=0){wallDrag=-1;ReleaseCapture();saveWallpaper();}if(draggingVolume){draggingVolume=false;ReleaseCapture();}return 0;
-        case WM_CAPTURECHANGED:if(dockPending){dockPending=dockMoving=false;saveDock();syncEdit();}styleDrag=0;draggingSeek=false;wallDrag=-1;draggingVolume=false;return 0;
+        case WM_LBUTTONUP:
+#ifdef ISLAND_INTERNAL_SETTINGS
+            if(internalDragging){internalFinishSlider();return 0;}
+#endif
+            if(dockPending){bool moved=dockMoving;dockPending=dockMoving=false;ReleaseCapture();if(moved){dockRatio=snapDockRatio(dockRatio);saveDock();position();}else{pinned=true;animate(true);}return 0;}if(styleDrag){styleDrag=0;ReleaseCapture();save();region();draw();}if(draggingSeek){draggingSeek=false;ReleaseCapture();if(now.duration>0)media.seek(seekRatio*now.duration);draw();}if(wallDrag>=0){wallDrag=-1;ReleaseCapture();saveWallpaper();}if(draggingVolume){draggingVolume=false;ReleaseCapture();}return 0;
+        case WM_CAPTURECHANGED:
+#ifdef ISLAND_INTERNAL_SETTINGS
+            if(internalDragging)internalFinishSlider();
+#endif
+            if(dockPending){dockPending=dockMoving=false;saveDock();syncEdit();}styleDrag=0;draggingSeek=false;wallDrag=-1;draggingVolume=false;return 0;
         case WM_MOUSEWHEEL:{
             POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};ScreenToClient(hwnd,&point);auto origin=uiOrigin();point.x-=(LONG)std::lround(origin.x*scale);point.y-=(LONG)std::lround(origin.y*scale);
+#ifdef ISLAND_INTERNAL_SETTINGS
+            if(expanded&&tab==8){if(internalDragging||internalClock)return 0;internalOffset=std::clamp(internalOffset-GET_WHEEL_DELTA_WPARAM(wp)/WHEEL_DELTA,0,std::max(0,(int)internalLayout().size()-InternalVisibleRows));draw();return 0;}
+#endif
             if(expanded&&tab==1)clipOffset=std::clamp(clipOffset-GET_WHEEL_DELTA_WPARAM(wp)/WHEEL_DELTA,0,std::max(0,(int)clips.size()-4));
             else if(expanded&&tab==2)fileOffset=std::clamp(fileOffset-GET_WHEEL_DELTA_WPARAM(wp)/WHEEL_DELTA,0,std::max(0,(int)files.size()-4));
             else if(expanded&&tab==11)appOffset=std::clamp(appOffset-GET_WHEEL_DELTA_WPARAM(wp)/WHEEL_DELTA,0,std::max(0,((int)shortcuts.size()+7)/8-3));
@@ -1063,11 +1140,11 @@ public:
         case WM_KEYDOWN:if(wp==VK_ESCAPE){pinned=false;animate(false);}return 0;
         case ComponentActionMessage:{std::unique_ptr<ComponentAction> action((ComponentAction*)lp);if(action)desktopAction(action->code,action->value);return 0;}
         case WM_TIMER:
-            if(wp==8){desktop.audioFrame();return 0;}
+            if(wp==8){desktop.audioFrame();welcome.update(!desktopEnabled||desktop.ready(),!systemSuspended&&displayActive&&sessionActive);return 0;}
             if(wp==5){KillTimer(hwnd,5);synchronizeDesktopLanguage(languageRoot,languageBefore);draw();return 0;}
             if(wp==6){KillTimer(hwnd,6);overlay.reset();desktop.displayChanged();desktop.maintain();fileBrowserDisplayChanged();position();tasks.refresh();audio.restart();refreshVisibility(true);return 0;}
             if(wp==1)tick();
-            if(wp==3){shell.maintain();volume=getVolume();muted=getMuted();micState=getMicState();if(!clipboardOn){clipboardOn=AddClipboardFormatListener(hwnd)!=FALSE;if(clipboardOn)PostMessageW(hwnd,WM_CLIPBOARDUPDATE,0,0);}if(expanded&&tab==5)storeEdit();draw();}
+            if(wp==3){if(!GetPropW(hwnd,L"OwnIsland.ShellReady")&&shellRetries<3){++shellRetries;if(shell.start(hwnd)){SetPropW(hwnd,L"OwnIsland.ShellReady",(HANDLE)1);position();}}shell.maintain();volume=getVolume();muted=getMuted();micState=getMicState();if(!clipboardOn){clipboardOn=AddClipboardFormatListener(hwnd)!=FALSE;if(clipboardOn)PostMessageW(hwnd,WM_CLIPBOARDUPDATE,0,0);}if(expanded&&tab==5)storeEdit();draw();}
             return 0;
         case WM_APP+1:now=media.snapshot();updateFrames();draw();return 0;
         case WM_APP+3:frame();return 0;
@@ -1078,6 +1155,7 @@ public:
         case WM_APP+8:shell.updateOverflow();draw();return 0;
         case WM_APP+12:{auto state=search.snapshot();if(state->query!=searchValue)return 0;std::wstring selected;if(searchSelected>=0&&searchSelected<(int)searchState->results.size())selected=searchState->results[searchSelected].path;searchState=state;if(!selected.empty())for(size_t i=0;i<state->results.size();i++)if(state->results[i].path==selected){searchSelected=(int)i;break;}if(tab==12)draw();return 0;}
         case WM_APP+13:desktop.maintain();updateFrames();return 0;
+        case WM_APP+87:if(StateDirectoryOverride.empty())startup::prepareEarly();return 0;
         case WM_APP+2:{std::unique_ptr<WeatherState> result((WeatherState*)lp);weatherBusy=false;if(result->available){weather=std::move(*result);cityValue=weatherRequestedCity;weatherEditing=false;WritePrivateProfileStringW(L"weather",L"city",cityValue.c_str(),ini.c_str());saveForecast();}else if(weather.available)weather.error=result->error;else weather=std::move(*result);syncEdit();draw();return 0;}
         case WM_APP+32:if(wp==0)toggleDesktop();if(wp==1){pinned=true;animate(true);changeTab(9);SetForegroundWindow(hwnd);}if(wp==2)openFileBrowser();if(wp==3)openSearch();return 0;
         case WM_APP+31:languageRoot=(HWND)wp;languageBefore=(HKL)lp;SetTimer(hwnd,5,80,nullptr);return 0;
@@ -1091,7 +1169,7 @@ public:
             if(LOWORD(wp)==100&&HIWORD(wp)==EN_CHANGE&&editOwner==5)SetTimer(hwnd,4,600,nullptr);
             if(LOWORD(wp)==101&&HIWORD(wp)==EN_KILLFOCUS){storeTimer();save();}
             return 0;
-        case WM_DISPLAYCHANGE:case WM_DPICHANGED:SetTimer(hwnd,6,300,nullptr);return 0;
+        case WM_DISPLAYCHANGE:case WM_DPICHANGED:welcome.displayChanged();SetTimer(hwnd,6,300,nullptr);return 0;
         case WM_WTSSESSION_CHANGE:shell.closeOverflow();if(wp==WTS_SESSION_LOCK||wp==WTS_CONSOLE_DISCONNECT||wp==WTS_REMOTE_DISCONNECT)sessionActive=false;else if(wp==WTS_SESSION_UNLOCK||wp==WTS_CONSOLE_CONNECT||wp==WTS_REMOTE_CONNECT)sessionActive=true;refreshVisibility(true);desktop.maintain();updateFrames();return 0;
         case WM_POWERBROADCAST:
             if(wp==PBT_APMSUSPEND){systemSuspended=true;shell.closeOverflow();refreshVisibility();desktop.maintain();updateFrames();return TRUE;}
@@ -1099,8 +1177,13 @@ public:
             if(wp==PBT_POWERSETTINGCHANGE){auto change=(POWERBROADCAST_SETTING*)lp;if(change&&IsEqualGUID(change->PowerSetting,GUID_CONSOLE_DISPLAY_STATE)&&change->DataLength==sizeof(DWORD)){DWORD state;memcpy(&state,change->Data,sizeof(state));displayActive=state!=0;refreshVisibility(true);desktop.maintain();updateFrames();}}return TRUE;
         case WM_SETTINGCHANGE:SetTimer(hwnd,6,300,nullptr);draw();return 0;
         case TrayMessage:if(lp==WM_RBUTTONUP)trayMenu();if(lp==WM_LBUTTONUP){pinned=!expanded;animate(!expanded);}return 0;
-        case ExternalCommand:if(wp==0){pinned=false;animate(false);}if(wp==1){pinned=true;manualHidden=false;ShowWindow(hwnd,SW_SHOWNOACTIVATE);animate(true);}if(wp==2){pinned=true;animate(true);changeTab((int)lp);}if(wp==3)toggleDesktop();return 0;
+        case ExternalCommand:
+#ifdef ISLAND_INTERNAL_SETTINGS
+            if(wp==6){internalSection=(int)std::clamp<LPARAM>(lp,0,3);internalOffset=0;internalClock=false;pinned=true;animate(true);changeTab(8);draw();return 0;}
+#endif
+            if(wp==0){pinned=false;animate(false);}if(wp==1){pinned=true;manualHidden=false;ShowWindow(hwnd,SW_SHOWNOACTIVATE);animate(true);}if(wp==2){pinned=true;animate(true);changeTab((int)lp);}if(wp==3)toggleDesktop();if(wp==4&&(lp==0||lp==1)){settings.seconds=lp!=0;save();draw();return 1;}if(wp==5)welcome.start(hwnd,true);return 0;
         case WM_COPYDATA:{auto cd=(COPYDATASTRUCT*)lp;
+            if(cd&&cd->dwData==island_settings::PacketTag){if(!cd->lpData||cd->cbData!=sizeof(island_settings::Packet)||closing||dialog||nativeSettingsBusy)return FALSE;island_settings::Packet p;memcpy(&p,cd->lpData,sizeof(p));if(!island_settings::valid(p))return FALSE;if(p.action){if(!island_settings::settingsOwner((HWND)(UINT_PTR)p.owner))return FALSE;auto copy=new(std::nothrow) island_settings::Packet(p);if(!copy)return FALSE;nativeSettingsBusy=true;if(!PostMessageW(hwnd,island_settings::QueuedAction,0,(LPARAM)copy)){nativeSettingsBusy=false;delete copy;return FALSE;}return TRUE;}try{return nativeSetting(p);}catch(...){return FALSE;}}
             std::unique_ptr<ComponentAction> action;if(receiveComponentAction((HWND)wp,cd,action)){if(action->code==DeskSaveNote){desktopAction(action->code,action->value);return TRUE;}auto raw=action.release();if(!PostMessageW(hwnd,ComponentActionMessage,0,(LPARAM)raw)){delete raw;return FALSE;}return TRUE;}
             if(cd&&cd->lpData&&(cd->dwData==0x4953464c||cd->dwData==0x4953524e)&&cd->cbData>=sizeof(wchar_t)&&cd->cbData<=65536&&cd->cbData%sizeof(wchar_t)==0){std::wstring s((const wchar_t*)cd->lpData,cd->cbData/sizeof(wchar_t));if(!s.empty()&&s.back()==L'\0')s.pop_back();return cd->dwData==0x4953464c?openFileBrowser(s):launchCommand(hwnd,s);}
             if(cd&&cd->dwData==0x49534c44&&cd->cbData>=sizeof(wchar_t)&&cd->cbData<=8192&&cd->cbData%sizeof(wchar_t)==0){std::wstring s((const wchar_t*)cd->lpData,cd->cbData/sizeof(wchar_t));if(!s.empty()&&s.back()==L'\0')s.pop_back();showToast(L"Уведомление",s);return TRUE;}return FALSE;}
@@ -1111,8 +1194,9 @@ public:
             if(wp){health::stopping(true);WritePrivateProfileStringW(L"shell",L"shutdown",L"1",(stateDirectory()+L"\\shell-restore.ini").c_str());storeEdit();}
             else{ShutdownBlockReasonDestroy(hwnd);health::stopping(false);}return 0;
         case WM_SYSCOMMAND:if((wp&0xfff0)==SC_CLOSE)return 0;break;
-        case WM_CLOSE:if(fileOperationsActive()){showToast(L"Выполняется операция с файлами");return 0;}WritePrivateProfileStringW(L"shell",L"shutdown",L"1",(stateDirectory()+L"\\shell-restore.ini").c_str());storeEdit();DestroyWindow(hwnd);return 0;
-        case WM_DESTROY:closing=true;network.stop();desktop.stop();if(displayNotification){UnregisterPowerSettingNotification(displayNotification);displayNotification=nullptr;}WTSUnRegisterSessionNotification(hwnd);shell.stop();search.stop();if(foregroundHook){UnhookWinEvent(foregroundHook);foregroundHook=nullptr;}taskHookTarget=nullptr;tasks.stop();frames.update(false);audio.enable(false);for(int i=1;i<=8;i++)KillTimer(hwnd,i);UnregisterHotKey(hwnd,1);if(clipboardOn)RemoveClipboardFormatListener(hwnd);Shell_NotifyIconW(NIM_DELETE,&tray);PostQuitMessage(0);return 0;
+        case island_settings::QueuedAction:{std::unique_ptr<island_settings::Packet> packet((island_settings::Packet*)lp);try{if(packet)nativeSetting(*packet);}catch(...){dialog=false;showToast(L"Не удалось изменить настройку");}nativeSettingsBusy=false;return 0;}
+        case WM_CLOSE:if(nativeSettingsBusy||GetPropW(hwnd,L"OwnIsland.DesktopSettingsBusy")){showToast(L"Открыто окно настройки");return 0;}if(fileOperationsActive()){showToast(L"Выполняется операция с файлами");return 0;}WritePrivateProfileStringW(L"shell",L"shutdown",L"1",(stateDirectory()+L"\\shell-restore.ini").c_str());storeEdit();DestroyWindow(hwnd);return 0;
+        case WM_DESTROY:closing=true;welcome.stop();network.stop();desktop.stop();if(displayNotification){UnregisterPowerSettingNotification(displayNotification);displayNotification=nullptr;}WTSUnRegisterSessionNotification(hwnd);shell.stop();search.stop();if(foregroundHook){UnhookWinEvent(foregroundHook);foregroundHook=nullptr;}taskHookTarget=nullptr;tasks.stop();frames.update(false);audio.enable(false);for(int i=1;i<=8;i++)KillTimer(hwnd,i);UnregisterHotKey(hwnd,1);if(clipboardOn)RemoveClipboardFormatListener(hwnd);Shell_NotifyIconW(NIM_DELETE,&tray);PostQuitMessage(0);return 0;
         }
         return DefWindowProcW(hwnd,msg,wp,lp);
     }
@@ -1126,8 +1210,77 @@ LRESULT CALLBACK wndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
     }
     return DefWindowProcW(hwnd,msg,wp,lp);
 }
-
-
+int selfTest() {
+    bool ok=!StandaloneMode;
+#ifdef ISLAND_INTERNAL_SETTINGS
+    {
+        wchar_t temporary[32768]={};GetTempPathW(32768,temporary);auto directory=std::wstring(temporary)+L"OwnIsland.InternalSettings.SelfTest."+std::to_wstring(GetCurrentProcessId());
+        bool created=CreateDirectoryW(directory.c_str(),nullptr)!=FALSE;ok&=created;auto previous=StateDirectoryOverride;StateDirectoryOverride=directory;int checks=0;bool internalOK=created;
+        auto expect=[&](bool value){++checks;internalOK&=value;};
+        {
+            Island fixture;fixture.desktopEnabled=false;fixture.shortcuts={L"C:\\Fixture\\Pinned.exe"};fixture.save();writeNote(L"Preserved fixture note");
+            HWND target=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,L"STATIC",L"",WS_POPUP,0,0,736,476,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);fixture.hwnd=target;fixture.gfx=std::make_unique<Graphics>();
+            bool graphics=target&&fixture.gfx->init(target,736,476,1);expect(graphics);size_t visibleSettings=0;
+            if(graphics){
+                for(int section=0;section<4;section++){
+                    fixture.internalSection=section;auto rows=fixture.internalRows();visibleSettings+=rows.size();
+                    for(int offset=0;offset<(int)fixture.internalLayout().size();offset+=Island::InternalVisibleRows){fixture.internalOffset=offset;fixture.hits.clear();fixture.gfx->begin();fixture.internalSettingsPage();expect(fixture.gfx->end());for(auto& hit:fixture.hits)expect(hit.box.x>=34&&hit.box.x+hit.box.w<=703&&hit.box.y>=54&&hit.box.y+hit.box.h<=313);}
+                }
+                expect(visibleSettings==49);fixture.internalSection=3;auto rows=fixture.internalRows();expect(std::find(rows.begin(),rows.end(),island_settings::Id::PanelFPS)!=rows.end());expect(std::find(rows.begin(),rows.end(),island_settings::Id::PerformanceEco)==rows.end());
+                fixture.internalSection=2;fixture.internalClock=true;fixture.hits.clear();fixture.gfx->begin();fixture.internalSettingsPage();expect(fixture.gfx->end());expect(fixture.hits.size()==14);fixture.internalClock=false;
+                for(auto hidden:{island_settings::Id::Edge,island_settings::Id::DesktopMonitor,island_settings::Id::DesktopEditor}){bool found=false;for(int section=0;section<4;section++){fixture.internalSection=section;auto list=fixture.internalRows();found|=std::find(list.begin(),list.end(),hidden)!=list.end();}expect(!found);}
+                fixture.internalSection=1;auto compact=fixture.internalLayout();expect(compact.size()<fixture.internalRows().size());
+                unsigned previousColor=Background;fixture.internalApply(island_settings::Id::Background,0,true);expect(fixture.tab==14&&Background==previousColor);fixture.colorValue=L"#A1B2C3";if(fixture.edit)SetWindowTextW(fixture.edit,fixture.colorValue.c_str());expect(Background==previousColor);fixture.changeTab(10);expect(fixture.tab==8&&Background==previousColor);
+                fixture.desktopEnabled=true;fixture.internalApply(island_settings::Id::DesktopAccent,0,true);expect(fixture.tab==14&&fixture.appearanceDesktop);fixture.colorValue=L"#A1B2C3";if(fixture.edit)SetWindowTextW(fixture.edit,fixture.colorValue.c_str());fixture.storeEdit();fixture.applyColor();expect(fixture.tab==8&&fixture.internalSection==2&&fixture.desktopLook.colors[2]==0xA1B2C3);fixture.desktopEnabled=false;
+            }
+            fixture.gfx.reset();fixture.hwnd=nullptr;if(target)DestroyWindow(target);fixture.edit=nullptr;fixture.timerEdit=nullptr;
+            fixture.internalApply(island_settings::Id::PanelFPS,30);expect(fixture.internalValue(island_settings::Id::PanelFPS)==30);expect(fixture.internalValue(island_settings::Id::VideoFPS)==30);
+            fixture.internalApply(island_settings::Id::PanelBlur,0);expect(fixture.wallBlur==0&&fixture.internalValue(island_settings::Id::PanelBlur)==0);
+            fixture.internalApply(island_settings::Id::OutlineWidth,.5);expect(BorderWidth==.5f);fixture.internalApply(island_settings::Id::OutlineWidth,0);expect(!fixture.internalEnabled(island_settings::Id::Outline));
+            fixture.internalSlideId=island_settings::Id::PanelShade;fixture.internalDragging=true;auto oldShade=fixture.wallShade;fixture.internalSliderPointer(562);expect(fixture.internalSlideValue==50&&fixture.wallShade==oldShade);fixture.internalFinishSlider();expect(fixture.wallShade==50&&!fixture.internalDragging);
+            fixture.wallOpacity=65;fixture.wallShade=35;fixture.saveWallpaper();fixture.internalApply(island_settings::Id::ThemeDark,0,true);expect(Outline==0x77717f);expect(fixture.wallOpacity==65&&fixture.wallShade==35&&fixture.wallBlur==0);
+            wchar_t pinned[128]={};GetPrivateProfileStringW(L"launch",L"0",L"",pinned,128,fixture.ini.c_str());expect(std::wstring(pinned)==L"C:\\Fixture\\Pinned.exe");expect(readNote()==L"Preserved fixture note");
+        }
+        StateDirectoryOverride=previous;std::ofstream(std::filesystem::path(directory)/L"result.json")<<"{\"passed\":"<<(internalOK?"true":"false")<<",\"checks\":"<<checks<<"}";ok&=internalOK;
+    }
+#endif
+    ok&=searchSelfTest()&&nativeDesktopSelfTest()&&traySelfTest()&&componentSelfTest();
+    ok&=spectrumSelfTest()&&desktopSelfTest();
+    auto top=dockBody(0,696,342),left=dockBody(3,696,342),right=dockBody(1,696,342),bottom=dockBody(2,696,342);ok&=top.x==20&&top.y==0&&left.x==0&&left.y==67&&left.w==696&&right.x==40&&bottom.y==134;auto points=islandOutline(left,3);ok&=points.front().x==0&&points.back().x==0&&points[4].x>0;ok&=snapDockRatio(.51f)==.5f&&snapDockRatio(.6f)==.6f&&snapDockRatio(.53f)>.5f&&snapDockRatio(.53f)<.53f;ok&=Island::hsv(0,1,1)==0xff0000&&Island::hsv(120,1,1)==0x00ff00&&Island::hsv(240,1,1)==0x0000ff&&contrast(0xffffff)==0x202126&&contrast(0)==0xf5f4f7;
+    ok&=transformText(L"Ghbdtn",2)==L"Привет";
+    ok&=transformText(L"Привет",2)==L"Ghbdtn";
+    ok&=transformText(L"  один \n два\t ",4)==L"один два";
+    ok&=transformText(L"Привет мир",0)==L"ПРИВЕТ МИР";
+    ok&=fileName(L"C:\\Folder\\file.txt")==L"file.txt";
+    ok&=duration(125)==L"2:05" && duration(3725)==L"1:02:05";
+    ok&=Box{10,20,30,40}.contains(15,25)&&!Box{10,20,30,40}.contains(41,25);
+    int seconds=0;ok&=parseTimer(L"2:30",seconds)&&seconds==150;ok&=parseTimer(L"10",seconds)&&seconds==600;
+    ok&=parseTimer(L"1:02:03",seconds)&&seconds==3723;ok&=!parseTimer(L"2:90",seconds)&&!parseTimer(L"0",seconds)&&!parseTimer(L"-1",seconds);
+    unsigned color=0;ok&=parseColor(L"#a1B2c3",color)&&color==0xa1b2c3;ok&=!parseColor(L"#GGGGGG",color);
+    // Navigation uses visual order, including the inserted Applications page.
+    ok&=tabRank(0)<tabRank(11)&&tabRank(11)<tabRank(1)&&tabRank(1)<tabRank(7);
+    ok&=!validTaskWindow({nullptr,GetCurrentProcessId(),L""});
+    DesktopLanguageChord language;ok&=!language.event(VK_LMENU,true)&&!language.event(VK_LSHIFT,true)&&language.event(VK_LSHIFT,false)&&!language.event(VK_LMENU,false);ok&=!language.event(VK_LSHIFT,true)&&!language.event(VK_LMENU,true)&&!language.event(VK_TAB,true)&&!language.event(VK_LMENU,false)&&!language.event(VK_LSHIFT,false);ok&=!language.event(VK_LMENU,true,true)&&!language.event(VK_LSHIFT,true,true)&&!language.event(VK_LSHIFT,false)&&!language.event(VK_LMENU,false);
+    ok&=standaloneShortcut('D',false)==0&&standaloneShortcut('R',false)==1&&standaloneShortcut('E',false)==2&&standaloneShortcut('S',false)==3&&standaloneShortcut('D',true)==-1&&standaloneShortcut('X',false)==-1;
+    WinKeyState key;
+    ok&=!key.event(VK_LWIN,true)&&!key.event(VK_LWIN,true)&&key.event(VK_LWIN,false);
+    ok&=!key.event(VK_LWIN,true)&&!key.event('D',true)&&!key.event('D',false)&&!key.event(VK_LWIN,false);
+    ok&=!key.event(VK_RWIN,true,true)&&!key.event(VK_RWIN,false);
+    // Exercise Ctrl+A inside a real, hidden Win32 edit without sending global input.
+    {
+        Island fixture;
+        HWND parent=CreateWindowExW(WS_EX_TOOLWINDOW,L"STATIC",L"",WS_POPUP,0,0,10,10,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+        HWND input=CreateWindowExW(0,L"EDIT",L"sample",WS_CHILD|ES_AUTOHSCROLL,0,0,10,10,parent,nullptr,GetModuleHandleW(nullptr),nullptr);
+        fixture.hwnd=parent;fixture.edit=input;
+        SetWindowLongPtrW(input,GWLP_USERDATA,(LONG_PTR)&fixture);
+        fixture.oldEditProc=(WNDPROC)SetWindowLongPtrW(input,GWLP_WNDPROC,(LONG_PTR)Island::editProc);
+        BYTE previous[256]={},keys[256]={};GetKeyboardState(previous);keys[VK_CONTROL]=0x80;SetKeyboardState(keys);
+        SendMessageW(input,EM_SETSEL,2,2);SendMessageW(input,WM_KEYDOWN,'A',0);SetKeyboardState(previous);
+        DWORD start=0,end=0;SendMessageW(input,EM_GETSEL,(WPARAM)&start,(LPARAM)&end);ok&=start==0&&end==6;
+        DestroyWindow(input);fixture.edit=nullptr;DestroyWindow(parent);fixture.hwnd=nullptr;
+    }
+    return ok&&files::selfTest()?0:1;
+}
 }
 
 int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
@@ -1138,35 +1291,64 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
     std::vector<std::wstring> arguments;bool explicitMode=false;
     for(int i=1;i<argc;i++){
         std::wstring a=argv[i];
-        if(a==L"--standalone"||a==L"--integrated"){StandaloneMode=a==L"--standalone";explicitMode=true;}
+        if(a==L"--standalone"||a==L"--integrated"){explicitMode=true;}
         else if(a==L"--state-dir"&&i+1<argc)StateDirectoryOverride=argv[++i];
         else arguments.push_back(a);
     }
-    if(!explicitMode)StandaloneMode=GetPrivateProfileIntW(L"shell",L"standalone",0,(stateDirectory()+L"\\settings.ini").c_str())!=0;
+    // Public distribution is Explorer-only, including legacy command lines/profiles.
     std::wstring arg=arguments.empty()?L"":arguments[0];
+    if(arg==L"--configure-autostart"){
+        bool valid=StateDirectoryOverride.empty()&&arguments.size()==2&&(arguments[1]==L"on"||arguments[1]==L"off");
+        HANDLE token=nullptr;TOKEN_ELEVATION elevation{};DWORD bytes=0;
+        bool elevated=!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&token)||!GetTokenInformation(token,TokenElevation,&elevation,sizeof(elevation),&bytes)||elevation.TokenIsElevated;if(token)CloseHandle(token);
+        bool result=valid&&!elevated&&startup::setEnabled(arguments[1]==L"on");
+        LocalFree(argv);OleUninitialize();CoUninitialize();return result?0:ERROR_ACCESS_DENIED;
+    }
+    if(arg==L"--configure-startup"){
+        HRESULT result=StateDirectoryOverride.empty()?startup::prepareEarly():E_ACCESSDENIED;
+        LocalFree(argv);OleUninitialize();CoUninitialize();return FAILED(result)?(int)result:0;
+    }
     auto value=arguments.size()>1?arguments[1]:L"";
     if(arg==L"--wallpaper-watch"){int result=wallpaperEngineWatch(arguments);LocalFree(argv);OleUninitialize();CoUninitialize();return result;}
     wchar_t modulePath[32768]={};GetModuleFileNameW(nullptr,modulePath,32768);auto moduleName=std::filesystem::path(modulePath).filename().wstring();
-    if(!_wcsicmp(moduleName.c_str(),L"Island.Files.exe")&&arg!=L"--files-host"){
+    if(!_wcsicmp(moduleName.c_str(),L"Island.Files.exe")&&arg!=L"--files-host"&&arg!=L"--self-test"){
         int result=(arg.empty()||arg==L"--files"||arg.front()!=L'-')?runFilesComponent(arg==L"--files"?value:arg):2;LocalFree(argv);OleUninitialize();CoUninitialize();return result;
     }
-    if(!_wcsicmp(moduleName.c_str(),L"Island.Desktop.exe")&&arg!=L"--desktop-host"){LocalFree(argv);OleUninitialize();CoUninitialize();return 2;}
+    if(!_wcsicmp(moduleName.c_str(),L"Island.Desktop.exe")&&arg!=L"--desktop-host"&&arg!=L"--self-test"){LocalFree(argv);OleUninitialize();CoUninitialize();return 2;}
     if(arg==L"--files"){bool ok=routeFileBrowser(value,false,false);LocalFree(argv);OleUninitialize();CoUninitialize();return ok?0:2;}
     if(arg==L"--desktop-host"){int result=runDesktopComponent(value);LocalFree(argv);OleUninitialize();CoUninitialize();return result;}
     if(arg==L"--files-host"){bool select=std::find(arguments.begin(),arguments.end(),L"--select")!=arguments.end(),fresh=std::find(arguments.begin(),arguments.end(),L"--new-window")!=arguments.end();int result=runFilesComponent(value,select,fresh);LocalFree(argv);OleUninitialize();CoUninitialize();return result;}
     if(arg==L"--shell-watch"&&arguments.size()>1){DWORD parent=wcstoul(value.c_str(),nullptr,10);LocalFree(argv);int code=shellWatch(parent);OleUninitialize();CoUninitialize();return code;}
-
+    if(arg==L"--self-test"){int code=selfTest();LocalFree(argv);OleUninitialize();CoUninitialize();return code;}
     struct InstanceLock {HANDLE handle=nullptr;bool owned=false;~InstanceLock(){if(owned)ReleaseMutex(handle);if(handle)CloseHandle(handle);}} instanceLock;
-    {
+    if(arg!=L"--status"){
         wchar_t desktopName[256]={};DWORD needed=0;GetUserObjectInformationW(GetThreadDesktop(GetCurrentThreadId()),UOI_NAME,desktopName,sizeof(desktopName),&needed);uint64_t hash=1469598103934665603ull;for(auto c:std::wstring(desktopName)){hash^=(uint16_t)c;hash*=1099511628211ull;}auto mutexName=L"Local\\OwnIsland.Instance."+std::to_wstring(hash);instanceLock.handle=CreateMutexW(nullptr,FALSE,mutexName.c_str());if(!instanceLock.handle){LocalFree(argv);OleUninitialize();CoUninitialize();return 4;}DWORD lock=WaitForSingleObject(instanceLock.handle,0);instanceLock.owned=lock==WAIT_OBJECT_0||lock==WAIT_ABANDONED;
         if(!instanceLock.owned){auto deadline=GetTickCount64()+12000;while(!FindWindowW(WindowClass,nullptr)&&GetTickCount64()<deadline){Sleep(25);lock=WaitForSingleObject(instanceLock.handle,0);if(lock==WAIT_OBJECT_0||lock==WAIT_ABANDONED){instanceLock.owned=true;break;}}if(!instanceLock.owned&&!FindWindowW(WindowClass,nullptr)){LocalFree(argv);OleUninitialize();CoUninitialize();return 4;}}
     }
     HWND existing=FindWindowW(WindowClass,nullptr);
-
+    if(arg==L"--status"&&arguments.size()>1){
+        HWND popup=FindWindowW(L"NotifyIconOverflowWindow",nullptr);RECT bounds{};if(popup)GetWindowRect(popup,&bounds);
+        CURSORINFO cursor{sizeof(cursor)};GetCursorInfo(&cursor);
+        std::ofstream output{std::filesystem::path(value.c_str())};
+        output<<"{\"running\":"<<(existing?"true":"false")<<",\"visible\":"<<(existing&&IsWindowVisible(existing)?"true":"false")<<",\"renderPaused\":"<<(existing&&GetPropW(existing,L"OwnIsland.RenderPaused")?"true":"false")<<",\"frames\":"<<(UINT_PTR)GetPropW(existing,L"OwnIsland.RenderedFrames")<<",\"desktopShown\":"<<(existing&&GetPropW(existing,L"OwnIsland.DesktopShown")?"true":"false")<<",\"cursor\":\""<<(cursor.hCursor==LoadCursorW(nullptr,IDC_HAND)?"hand":cursor.hCursor==LoadCursorW(nullptr,IDC_ARROW)?"arrow":"other")<<"\",\"overflowVisible\":"<<(popup&&IsWindowVisible(popup)?"true":"false")<<",\"overflowBounds\":["<<bounds.left<<","<<bounds.top<<","<<bounds.right-bounds.left<<","<<bounds.bottom-bounds.top<<"]";
+        output<<",\"desktopProcess\":"<<(UINT_PTR)GetPropW(existing,L"OwnIsland.DesktopProcess");
+        output<<",\"taskGroups\":"<<(UINT_PTR)GetPropW(existing,L"OwnIsland.TaskGroups");
+        output<<",\"trayHosted\":"<<(GetPropW(existing,L"OwnIsland.TrayHosted")?"true":"false")<<",\"trayCount\":"<<(UINT_PTR)GetPropW(existing,L"OwnIsland.TrayCount");
+        output<<",\"shellReady\":"<<(GetPropW(existing,L"OwnIsland.ShellReady")?"true":"false")<<",\"bridgeIntervalMs\":"<<(UINT_PTR)GetPropW(existing,L"OwnIsland.BridgeIntervalMs");
+        output<<",\"standalone\":"<<(GetPropW(existing,L"OwnIsland.Standalone")?"true":"false")<<",\"nativeDesktop\":"<<nativeDesktopDiagnostics();
+        HWND files=(HWND)GetPropW(existing,L"OwnIsland.FilesWindow");output<<",\"fileWindow\":"<<(UINT_PTR)files<<",\"fileCount\":"<<(UINT_PTR)GetPropW(files,L"OwnIsland.Files.Count")<<",\"fileGraphics\":"<<(GetPropW(files,L"OwnIsland.Files.Graphics")?"true":"false")<<",\"fileRenderedCount\":"<<(UINT_PTR)GetPropW(files,L"OwnIsland.Files.RenderedCount");
+        HWND fg=GetForegroundWindow();output<<",\"foreground\":"<<(UINT_PTR)fg<<",\"foregroundLayout\":"<<(UINT_PTR)GetKeyboardLayout(GetWindowThreadProcessId(fg,nullptr))<<",\"islandLayout\":"<<(UINT_PTR)GetKeyboardLayout(GetWindowThreadProcessId(existing,nullptr))<<",\"dockLocked\":"<<(GetPropW(existing,L"OwnIsland.DockLocked")?"true":"false")<<",\"mediaPlaying\":"<<(GetPropW(existing,L"OwnIsland.MediaPlaying")?"true":"false");
+        output<<",\"desktopCount\":"<<(UINT_PTR)GetPropW(existing,L"OwnIsland.DesktopCount")<<",\"desktopActive\":"<<(GetPropW(existing,L"OwnIsland.DesktopActive")?"true":"false")<<",\"desktopViews\":[";
+        for(UINT_PTR i=0,count=(UINT_PTR)GetPropW(existing,L"OwnIsland.DesktopCount");i<count&&i<16;i++){auto key=L"OwnIsland.DesktopView"+std::to_wstring(i);HWND view=(HWND)GetPropW(existing,key.c_str());RECT rectangle{};GetWindowRect(view,&rectangle);if(i)output<<",";output<<"{\"enginePhase\":"<<(UINT_PTR)GetPropW((HWND)GetPropW(view,L"OwnIsland.EngineAnchor"),L"OwnIsland.EnginePhase")<<",\"engineWindow\":"<<(UINT_PTR)GetPropW(view,L"OwnIsland.EngineRetained")<<",\"engineLoading\":"<<(GetPropW(view,L"OwnIsland.EngineLoading")?"true":"false")<<",\"surfaceRevision\":"<<(UINT_PTR)GetPropW(view,L"OwnIsland.SurfaceRevision")<<",\"hwnd\":"<<(UINT_PTR)view<<",\"host\":"<<(UINT_PTR)GetAncestor(view,GA_ROOT)<<",\"hostProcess\":"<<([](HWND w){DWORD pid=0;GetWindowThreadProcessId(GetAncestor(w,GA_ROOT),&pid);return pid;})(view)<<",\"paused\":"<<(GetPropW(view,L"OwnIsland.DesktopPaused")?"true":"false")<<",\"frames\":"<<(UINT_PTR)GetPropW(view,L"OwnIsland.DesktopFrames")<<",\"bounds\":["<<rectangle.left<<","<<rectangle.top<<","<<rectangle.right-rectangle.left<<","<<rectangle.bottom-rectangle.top<<"],\"editing\":"<<(GetPropW(view,L"OwnIsland.Editing")?"true":"false")<<",\"clockShadow\":"<<(GetPropW(view,L"OwnIsland.ClockShadow")?"true":"false")<<",\"widgets\":[";for(int w=0;w<15;w++){if(w)output<<",";auto prefix=L"OwnIsland.Widget"+std::to_wstring(w);output<<"["<<(INT_PTR)GetPropW(view,(prefix+L"X").c_str())<<","<<(INT_PTR)GetPropW(view,(prefix+L"Y").c_str())<<","<<(GetPropW(view,(prefix+L"Visible").c_str())?1:0)<<","<<(INT_PTR)GetPropW(view,(prefix+L"W").c_str())<<","<<(INT_PTR)GetPropW(view,(prefix+L"H").c_str())<<","<<(GetPropW(view,(prefix+L"Vertical").c_str())?1:0)<<","<<(INT_PTR)GetPropW(view,(prefix+L"Angle").c_str())<<"]";}output<<"],\"imageFrame\":"<<(UINT_PTR)GetPropW(view,L"OwnIsland.ImageFrame")<<"}";}
+        output<<"]}";
+        LocalFree(argv);OleUninitialize();CoUninitialize();return 0;
+    }
     if(existing) {
         if(arg==L"--quit")PostMessageW(existing,WM_CLOSE,0,0);
         else if(arg==L"--collapse")PostMessageW(existing,ExternalCommand,0,0);
         else if(arg==L"--desktop")PostMessageW(existing,ExternalCommand,3,0);
+        else if(arg==L"--welcome-preview")PostMessageW(existing,ExternalCommand,5,0);
+        else if(arg==L"--logon"){}
         else if(arg==L"--tab"&&arguments.size()>1)PostMessageW(existing,ExternalCommand,2,std::clamp(_wtoi(value.c_str()),0,15));
         else if(arg==L"--files"||arg==L"--run"){std::wstring s=value;COPYDATASTRUCT cd={arg==L"--files"?0x4953464cul:0x4953524eul,(DWORD)((s.size()+1)*sizeof(wchar_t)),s.data()};DWORD_PTR result;SendMessageTimeoutW(existing,WM_COPYDATA,0,(LPARAM)&cd,SMTO_ABORTIFHUNG,1500,&result);}
         else if(arg==L"--notify"&&arguments.size()>1){std::wstring s=value.c_str();COPYDATASTRUCT cd={0x49534c44,(DWORD)((s.size()+1)*sizeof(wchar_t)),s.data()};DWORD_PTR result;SendMessageTimeoutW(existing,WM_COPYDATA,0,(LPARAM)&cd,SMTO_ABORTIFHUNG,1000,&result);}
@@ -1175,11 +1357,15 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
     }
     if(arg==L"--quit"||arg==L"--collapse"||arg==L"--notify"){LocalFree(argv);OleUninitialize();CoUninitialize();return 0;}
     if(explicitMode)WritePrivateProfileStringW(L"shell",L"standalone",StandaloneMode?L"1":L"0",(stateDirectory()+L"\\settings.ini").c_str());
-    if(!startShellProtection()){LocalFree(argv);OleUninitialize();CoUninitialize();return 3;}
-    Island app;
+    Island app;app.logonStartup=arg==L"--logon";
+    if(app.logonStartup)app.welcome.start(nullptr);
+    // The visual may prepare while Explorer starts; it never changes native shell state.
+    if(app.logonStartup){auto deadline=GetTickCount64()+15000;while(!FindWindowW(L"Shell_TrayWnd",nullptr)&&GetTickCount64()<deadline)Sleep(25);}
+    if(!startShellProtection()){app.welcome.stop();LocalFree(argv);OleUninitialize();CoUninitialize();return 3;}
     WNDCLASSEXW cls={sizeof(cls)};cls.lpfnWndProc=wndProc;cls.hInstance=instance;cls.lpszClassName=WindowClass;cls.hCursor=LoadCursorW(nullptr,IDC_ARROW);cls.hIcon=LoadIconW(instance,MAKEINTRESOURCEW(1));RegisterClassExW(&cls);
     HWND hwnd=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_TOPMOST|WS_EX_NOREDIRECTIONBITMAP,WindowClass,L"Остров",WS_POPUP|WS_CLIPCHILDREN|WS_CLIPSIBLINGS,0,0,1,1,nullptr,nullptr,instance,&app);
     if(!hwnd){LocalFree(argv);OleUninitialize();CoUninitialize();return 2;}
+    if(arg==L"--welcome-preview")app.welcome.start(hwnd,true);
     app.refreshStartupLauncher();
     shellProtectionReady();
     SetPropW(hwnd,L"OwnIsland.GuardedBeforeUI",(HANDLE)1);

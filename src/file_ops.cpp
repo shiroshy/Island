@@ -941,6 +941,9 @@ void openWith(HWND owner, const std::wstring &path) {
     OPENASINFO info{path.c_str(), nullptr, OAIF_EXEC};
     SHOpenWithDialog(owner, &info);
 }
-
-
+bool selfTest() {
+    return validName(L"Музыка.txt") && !validName(L"CON.txt") && !validName(L"../a") && !validName(L"a.") &&
+           !validName(L"NUL") && absolutePath(L"C:\\file.txt") && !absolutePath(L"relative.txt") &&
+           !absolutePath(L"C:\\*.txt") && quoteArgument(L"a\\") == L"\"a\\\\\"";
+}
 } // namespace files

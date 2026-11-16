@@ -134,6 +134,14 @@ void Graphics::text(const std::wstring& value, Box r, float size, unsigned color
     brush->SetColor(rgb(color));
     context->DrawTextW(value.c_str(), (UINT32)value.size(), fmt, r.rect(), brush.p, D2D1_DRAW_TEXT_OPTIONS_CLIP);
 }
+void Graphics::polygon(std::initializer_list<D2D1_POINT_2F> points,unsigned color,float opacity){
+    if(points.size()<3)return;Com<ID2D1PathGeometry> geometry;Com<ID2D1GeometrySink> sink;
+    if(FAILED(factory->CreatePathGeometry(geometry.put()))||FAILED(geometry->Open(sink.put())))return;
+    auto p=points.begin();sink->BeginFigure(*p++,D2D1_FIGURE_BEGIN_FILLED);
+    for(;p!=points.end();++p)sink->AddLine(*p);
+    sink->EndFigure(D2D1_FIGURE_END_CLOSED);if(FAILED(sink->Close()))return;
+    brush->SetColor(rgb(color,opacity));context->FillGeometry(geometry.p,brush.p);
+}
 void Graphics::icon(const wchar_t* glyph, Box r, float size, unsigned color) {
     text(glyph, r, size, color, false, DWRITE_TEXT_ALIGNMENT_CENTER, false, L"Segoe MDL2 Assets");
 }

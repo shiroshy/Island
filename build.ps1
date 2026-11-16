@@ -1,13 +1,18 @@
 # Copyright 2026 Shizuka
 # SPDX-License-Identifier: Apache-2.0
+
 param(
     [string]$CompilerRoot,
     [string]$OutputPath,
     [string]$WinrtRoot,
-    [string]$CacheRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '.build'))
+    [ValidateSet('Internal')][string]$SettingsMode='Internal',
+    [string]$CacheRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'work\build'))
 )
 $ErrorActionPreference = 'Stop'
-if (-not $OutputPath) { $OutputPath = Join-Path $PSScriptRoot 'dist\Island.exe' }
+if (-not $OutputPath) { $OutputPath = Join-Path $PSScriptRoot 'Island.exe' }
+$outputDirectory=[IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($OutputPath))
+New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
+$workspace = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 New-Item -ItemType Directory -Path $CacheRoot -Force | Out-Null
 function Get-Archive([string]$Url, [string]$Name, [string]$Destination) {
     $archive = Join-Path $CacheRoot $Name
@@ -15,36 +20,39 @@ function Get-Archive([string]$Url, [string]$Name, [string]$Destination) {
     Expand-Archive -LiteralPath $archive -DestinationPath $Destination -Force
 }
 if (-not $CompilerRoot) {
-    $CompilerRoot = Join-Path $CacheRoot 'llvm-mingw-20261020-ucrt-x86_64'
-    if (-not (Test-Path -LiteralPath (Join-Path $CompilerRoot 'bin\clang++.exe'))) {
-        Get-Archive 'https://github.com/mstorsjo/llvm-mingw/releases/download/20261020/llvm-mingw-20261020-ucrt-x86_64.zip' 'compiler.zip' $CacheRoot
+    $existing = Join-Path $workspace 'work\toolchain\llvm-mingw-20261020-ucrt-x86_64'
+    if (Test-Path -LiteralPath (Join-Path $existing 'bin\clang++.exe')) { $CompilerRoot = $existing }
+    else {
+        $CompilerRoot = Join-Path $CacheRoot 'llvm-mingw-20261020-ucrt-x86_64'
+        if (-not (Test-Path -LiteralPath (Join-Path $CompilerRoot 'bin\clang++.exe'))) {
+            Get-Archive 'https://github.com/mstorsjo/llvm-mingw/releases/download/20261020/llvm-mingw-20261020-ucrt-x86_64.zip' 'compiler.zip' $CacheRoot
+        }
     }
 }
 if (-not $WinrtRoot) {
-    $WinrtRoot = Join-Path $CacheRoot 'generated'
-    if (-not (Test-Path -LiteralPath (Join-Path $WinrtRoot 'winrt\Windows.Media.Control.h'))) {
-        $contracts = Join-Path $CacheRoot 'contracts'
-        $cppwinrt = Join-Path $CacheRoot 'cppwinrt'
-        Get-Archive 'https://api.nuget.org/v3-flatcontainer/microsoft.windows.sdk.contracts/10.0.19041.1/microsoft.windows.sdk.contracts.10.0.19041.1.nupkg' 'contracts.zip' $contracts
-        Get-Archive 'https://api.nuget.org/v3-flatcontainer/microsoft.windows.cppwinrt/2.0.240405.15/microsoft.windows.cppwinrt.2.0.240405.15.nupkg' 'cppwinrt.zip' $cppwinrt
-        & (Join-Path $cppwinrt 'bin\cppwinrt.exe') -input (Join-Path $contracts 'ref\netstandard2.0') -output $WinrtRoot
-        if ($LASTEXITCODE -ne 0) { throw 'C++/WinRT generation failed.' }
+    $existing = Join-Path $workspace 'work\sdk\generated'
+    if (Test-Path -LiteralPath (Join-Path $existing 'winrt\Windows.Media.Control.h')) { $WinrtRoot = $existing }
+    else {
+        $WinrtRoot = Join-Path $CacheRoot 'generated'
+        if (-not (Test-Path -LiteralPath (Join-Path $WinrtRoot 'winrt\Windows.Media.Control.h'))) {
+            $contracts = Join-Path $CacheRoot 'contracts'
+            $cppwinrt = Join-Path $CacheRoot 'cppwinrt'
+            Get-Archive 'https://api.nuget.org/v3-flatcontainer/microsoft.windows.sdk.contracts/10.0.19041.1/microsoft.windows.sdk.contracts.10.0.19041.1.nupkg' 'contracts.zip' $contracts
+            Get-Archive 'https://api.nuget.org/v3-flatcontainer/microsoft.windows.cppwinrt/2.0.240405.15/microsoft.windows.cppwinrt.2.0.240405.15.nupkg' 'cppwinrt.zip' $cppwinrt
+            & (Join-Path $cppwinrt 'bin\cppwinrt.exe') -input (Join-Path $contracts 'ref\netstandard2.0') -output $WinrtRoot
+            if ($LASTEXITCODE -ne 0) { throw 'C++/WinRT generation failed.' }
+        }
     }
 }
-$outputDirectory = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($OutputPath))
-New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
 $src = Join-Path $PSScriptRoot 'src'
 $resource = Join-Path $CacheRoot 'resources.o'
 & (Join-Path $CompilerRoot 'bin\llvm-windres.exe') -I $src (Join-Path $src 'Island.rc') $resource
 if ($LASTEXITCODE -ne 0) { throw 'Resource compilation failed.' }
 $compileFlags = @('-std=c++20', '-DUNICODE', '-D_UNICODE', '-DWINVER=0x0A00', '-D_WIN32_WINNT=0x0A00', '-I', $WinrtRoot, '-O2', '-fms-extensions', '-Wno-unknown-pragmas')
-$pathMappings = @(
-    ('-ffile-prefix-map=' + [IO.Path]::GetFullPath($PSScriptRoot) + '=.'),
-    ('-ffile-prefix-map=' + [IO.Path]::GetFullPath($WinrtRoot) + '=external/cppwinrt'),
-    ('-ffile-prefix-map=' + [IO.Path]::GetFullPath($CompilerRoot) + '=external/llvm-mingw')
-)
-$compileFlags += $pathMappings
-$sources = @('app.cpp','platform.cpp','graphics.cpp','picker.cpp','audio.cpp','menu.cpp','tasks.cpp','shell.cpp','overlay.cpp','search.cpp','desktop.cpp','wallpaper.cpp','wallpaper_engine.cpp','network.cpp','widget_image.cpp','native_desktop.cpp','runtime.cpp','tray.cpp','file_browser.cpp','file_ops.cpp','components.cpp')
+$pathMappings=@(('-ffile-prefix-map='+[IO.Path]::GetFullPath($PSScriptRoot)+'=.'), ('-ffile-prefix-map='+[IO.Path]::GetFullPath($WinrtRoot)+'=external/cppwinrt'), ('-ffile-prefix-map='+[IO.Path]::GetFullPath($CompilerRoot)+'=external/llvm-mingw'))
+$compileFlags+=$pathMappings
+if($SettingsMode -eq 'Internal'){$compileFlags+='-DISLAND_INTERNAL_SETTINGS'}
+$sources = @('app.cpp','platform.cpp','graphics.cpp','picker.cpp','settings_ui.cpp','audio.cpp','menu.cpp','tasks.cpp','shell.cpp','overlay.cpp','search.cpp','desktop.cpp','wallpaper.cpp','wallpaper_engine.cpp','network.cpp','widget_image.cpp','native_desktop.cpp','runtime.cpp','tray.cpp','file_browser.cpp','file_ops.cpp','components.cpp','welcome.cpp','startup.cpp')
 $objectRoot = Join-Path $CacheRoot 'objects'
 New-Item -ItemType Directory -Path $objectRoot -Force | Out-Null
 $compiler = Join-Path $CompilerRoot 'bin\clang++.exe'
@@ -63,18 +71,16 @@ $objects = foreach ($name in $sources) {
     $object
 }
 $arguments = @($objects) + @($resource, '-o', $OutputPath, '-mwindows', '-municode', '-static', '-s')
-$arguments += @('-ld2d1','-ldwrite','-ld3d11','-ldxgi','-ldcomp','-ldwmapi','-lwindowscodecs','-lole32','-loleaut32','-luuid','-lshell32','-lshlwapi','-lcomdlg32','-ladvapi32','-luser32','-lgdi32','-lpowrprof','-lshcore','-lruntimeobject','-lkernel32','-lwinhttp','-liphlpapi','-lwtsapi32','-lmfplat','-lmfreadwrite','-lmfuuid')
+$arguments += @('-ld2d1','-ldwrite','-ld3d11','-ldxgi','-ldcomp','-ldwmapi','-lwindowscodecs','-lole32','-loleaut32','-luuid','-lshell32','-lshlwapi','-lcomdlg32','-ladvapi32','-luser32','-lgdi32','-lpowrprof','-lshcore','-lruntimeobject','-lkernel32','-lwinhttp','-liphlpapi','-lwtsapi32','-lmfplat','-lmfreadwrite','-lmfuuid','-ltaskschd')
 & $compiler @arguments
 if ($LASTEXITCODE -ne 0) { throw 'Link failed. Close the target executable before replacing it.' }
+$check = Start-Process -FilePath $OutputPath -ArgumentList '--self-test' -WindowStyle Hidden -Wait -PassThru
+if ($check.ExitCode -ne 0) { throw ('Self-test failed: ' + $check.ExitCode) }
+Write-Output 'Built Island.exe. Self-test passed.'
 foreach($component in @('Island.Desktop.exe','Island.Files.exe')) {
     Copy-Item -LiteralPath $OutputPath -Destination (Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($OutputPath))) $component) -Force
 }
 
 $bootstrap = Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($OutputPath))) 'Island.Start.exe'
-& $compiler (Join-Path $src 'bootstrap.cpp') (Join-Path $src 'native_desktop.cpp') $resource '-o' $bootstrap '-std=c++20' '-DUNICODE' '-D_UNICODE' '-D_WIN32_WINNT=0x0A00' '-Os' '-static' '-s' '-mwindows' '-municode' '-lshell32' '-luser32' '-ladvapi32' @pathMappings
+& $compiler (Join-Path $src 'bootstrap.cpp') (Join-Path $src 'native_desktop.cpp') $resource @pathMappings '-o' $bootstrap '-std=c++20' '-DUNICODE' '-D_UNICODE' '-D_WIN32_WINNT=0x0A00' '-Os' '-static' '-s' '-mwindows' '-municode' '-lshell32' '-luser32' '-ladvapi32'
 if ($LASTEXITCODE -ne 0) { throw 'Bootstrap compilation failed.' }
-
-foreach($name in @('README.md','LICENSE','THIRD_PARTY_NOTICES','Stop-Island.cmd')) {
-    Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $outputDirectory $name) -Force
-}
-Write-Output ('Built Island in ' + $outputDirectory)

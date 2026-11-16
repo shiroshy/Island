@@ -61,6 +61,20 @@ bool nativeDesktopTakeover(HWND host){
     return !(GetWindowLongPtrW(window,GWL_STYLE)&WS_VISIBLE)&&!IsWindowEnabled(window);
 }
 void nativeDesktopRelease(){Lock lock;if(!lock.ready)return;auto recoveryFile=file();if((DWORD)GetPrivateProfileIntW(L"shell",L"pid",0,recoveryFile.c_str())==(ProtectionOwner?ProtectionOwner:GetCurrentProcessId()))nativeDesktopRecover(recoveryFile);held.clear();}
-
-
-
+std::string nativeDesktopDiagnostics(){
+    std::ostringstream out;out<<"[";bool first=true;for(auto w:nativeViews()){if(!first)out<<",";first=false;out<<"{\"hwnd\":"<<(UINT_PTR)w<<",\"visible\":"<<((GetWindowLongPtrW(w,GWL_STYLE)&WS_VISIBLE)?"true":"false")<<",\"enabled\":"<<(IsWindowEnabled(w)?"true":"false")<<",\"owner\":"<<(UINT_PTR)GetPropW(w,marker)<<"}";}out<<"]";return out.str();
+}
+bool nativeDesktopSelfTest(){
+    // Test restoration and stale ownership using only our own hidden windows.
+    HINSTANCE instance=GetModuleHandleW(nullptr);WNDCLASSEXW c{sizeof(c)};c.hInstance=instance;c.lpfnWndProc=DefWindowProcW;c.lpszClassName=L"WorkerW";RegisterClassExW(&c);c.lpszClassName=L"SHELLDLL_DefView";RegisterClassExW(&c);
+    HWND root=CreateWindowExW(0,L"WorkerW",L"",WS_POPUP,0,0,10,10,nullptr,nullptr,instance,nullptr);
+    HWND view=root?CreateWindowExW(0,L"SHELLDLL_DefView",L"",WS_CHILD|WS_VISIBLE,0,0,10,10,root,nullptr,instance,nullptr):nullptr;
+    if(!view){if(root)DestroyWindow(root);return false;}
+    Record r{view,GetCurrentProcessId(),GetCurrentProcessId(),true,true};SetPropW(view,marker,(HANDLE)(UINT_PTR)r.owner);ShowWindow(view,SW_HIDE);EnableWindow(view,FALSE);
+    wchar_t temp[MAX_PATH]={};GetTempPathW(MAX_PATH,temp);auto recovery=std::wstring(temp)+L"OwnIsland-native-test-"+std::to_wstring(r.owner)+L".ini";
+    WritePrivateProfileStringW(section,L"view-0",encode(r).c_str(),recovery.c_str());WritePrivateProfileStringW(section,L"count",L"1",recovery.c_str());nativeDesktopRecover(recovery);
+    bool ok=(GetWindowLongPtrW(view,GWL_STYLE)&WS_VISIBLE)&&IsWindowEnabled(view)&&!GetPropW(view,marker);
+    r.visible=r.enabled=false;SetPropW(view,marker,(HANDLE)(UINT_PTR)r.owner);ok&=restoreRecord(r)&&!(GetWindowLongPtrW(view,GWL_STYLE)&WS_VISIBLE)&&!IsWindowEnabled(view);
+    r.visible=r.enabled=true;SetPropW(view,marker,(HANDLE)(UINT_PTR)(r.owner+1));ok&=!restoreRecord(r)&&!(GetWindowLongPtrW(view,GWL_STYLE)&WS_VISIBLE)&&!IsWindowEnabled(view);
+    DestroyWindow(root);DeleteFileW(recovery.c_str());return ok;
+}

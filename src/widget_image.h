@@ -16,4 +16,4 @@ public:
     void setActive(bool value,int maximumFPS=30);
     WidgetImageState snapshot(){std::lock_guard lock(mutex);return state;}
 };
-
+bool widgetImageSelfTest();

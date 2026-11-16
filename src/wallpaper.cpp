@@ -84,22 +84,23 @@ struct VideoFrames {
     bool rewind(){PROPVARIANT position{};position.vt=VT_I8;position.hVal.QuadPart=0;return SUCCEEDED(reader->SetCurrentPosition(GUID_NULL,position));}
 };
 }
-void WallpaperMedia::start(const std::wstring& key,bool enabled){if(worker.joinable())return;prefix=key;state.enabled=enabled;stopping=false;worker=std::thread([this]{run();});}
+void WallpaperMedia::start(const std::wstring& key,bool enabled){if(worker.joinable())return;prefix=key;state.enabled=enabled;state.loading=enabled;stopping=false;worker=std::thread([this]{run();});}
 void WallpaperMedia::stop(){{std::lock_guard l(mutex);stopping=true;}wake.notify_all();if(worker.joinable())worker.join();}
 bool WallpaperMedia::choose(HWND owner,bool video){auto path=chooseWallpaper(owner,video);if(path.empty())return false;{std::lock_guard l(mutex);request=path;++generation;state.loading=true;state.error.clear();}wake.notify_all();return true;}
 void WallpaperMedia::clear(){{std::lock_guard l(mutex);++generation;request.clear();state={};}wake.notify_all();}
 void WallpaperMedia::enable(bool value){{std::lock_guard l(mutex);state.enabled=value;}wake.notify_all();}
 void WallpaperMedia::setActive(bool value){bool changed;{std::lock_guard l(mutex);changed=active!=value;active=value;}if(changed)wake.notify_all();}
+void WallpaperMedia::setFrameRate(int fps){std::lock_guard l(mutex);maximumFPS=std::clamp(fps,5,60);}
 WallpaperState WallpaperMedia::snapshot(){std::lock_guard l(mutex);return state;}
 void WallpaperMedia::run(){
     CoInitializeEx(nullptr,COINIT_MULTITHREADED);bool mf=SUCCEEDED(MFStartup(MF_VERSION));
     auto root=stateDirectory(),ini=root+L"\\settings.ini",metadata=root+L"\\"+prefix+L"-wallpaper-source.txt";
     auto saved=mediaText(metadata);auto split=saved.find(L'\n');std::wstring oldCache=split==std::wstring::npos?L"":saved.substr(split+1),original=split==std::wstring::npos?L"":saved.substr(0,split);
     if(oldCache.empty()&&prefix==L"desktop"){oldCache=root+L"\\wallpaper-cache";original=mediaText(root+L"\\wallpaper-path.txt");}
-    bool initial=true;uint64_t loaded=~0ull;VideoFrames video;ULONGLONG base=0;LONGLONG first=0;bool timing=false;
-    while(true){std::wstring path;uint64_t revision=0;bool use=false,enabled=false;
-        {std::unique_lock l(mutex);if(stopping)break;revision=generation;enabled=state.enabled;use=active&&enabled;
-            if(!request.empty()){path=request;request.clear();initial=false;}else if(initial){initial=false;if(enabled)path=oldCache;}
+    bool initial=true;uint64_t loaded=~0ull;VideoFrames video;ULONGLONG base=0,nextPixels=0;LONGLONG first=0;bool timing=false;
+    while(true){std::wstring path;uint64_t revision=0;bool use=false,enabled=false;int outputFPS=60;
+        {std::unique_lock l(mutex);if(stopping)break;revision=generation;enabled=state.enabled;use=active&&enabled;outputFPS=maximumFPS;
+            if(!request.empty()){path=request;request.clear();initial=false;}else if(initial){initial=false;if(enabled)path=oldCache;if(path.empty())state.loading=false;}
             if(path.empty()&&(!use||!state.video||!video.reader)){if(!use)timing=false;if(revision!=loaded&&!state.enabled)video.reader.reset();wake.wait_for(l,std::chrono::milliseconds(200));continue;}}
         if(!path.empty()){
             VideoFrames nextVideo;bool isVideo=videoPath(path),ended=false;auto image=isVideo?(mf&&nextVideo.open(path)?nextVideo.next(ended):nullptr):readWallpaper(path,mediaImageId++);
@@ -117,10 +118,13 @@ void WallpaperMedia::run(){
         if(loaded!=revision){video.reader.reset();continue;}
         bool ended=false;bool decoded=video.read(ended);if(ended){if(!video.rewind())video.reader.reset();timing=false;continue;}
         if(!decoded){std::lock_guard l(mutex);state.error=L"Не удалось прочитать кадр видео";video.reader.reset();continue;}
-        if(!timing){base=GetTickCount64();first=video.timestamp;timing=true;}
+        if(!timing){base=GetTickCount64();first=video.timestamp;timing=true;nextPixels=0;}
         auto due=base+(ULONGLONG)std::max<LONGLONG>(0,(video.timestamp-first)/10000);
         // Decode dependencies in order, but do not copy/upload frames whose display time has passed.
         if(due+std::max<LONGLONG>(1,video.duration/10000)<GetTickCount64())continue;
+        // Keep decoder dependencies, but avoid CPU copies and GPU uploads above the budget.
+        if(nextPixels&&due<nextPixels)continue;
+        nextPixels=due+1000/outputFPS;
         auto image=video.pixels();if(!image){std::lock_guard l(mutex);state.error=L"Не удалось прочитать кадр видео";video.reader.reset();continue;}
         {std::unique_lock l(mutex);if(!active||!state.enabled){timing=false;continue;}auto now=GetTickCount64();while(due>now&&!stopping&&generation==loaded&&active&&state.enabled){wake.wait_for(l,std::chrono::milliseconds(due-now),[&]{return stopping||generation!=loaded||!active||!state.enabled;});now=GetTickCount64();}if(stopping)break;if(generation==loaded&&active&&state.enabled)state.image=std::move(image);else timing=false;}
     }

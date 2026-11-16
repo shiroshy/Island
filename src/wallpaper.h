@@ -13,7 +13,7 @@ struct WallpaperState {
 class WallpaperMedia {
     std::mutex mutex;std::condition_variable wake;std::thread worker;
     std::wstring prefix,request;WallpaperState state;
-    bool stopping=false,active=false;uint64_t generation=0;
+    bool stopping=false,active=false;uint64_t generation=0;int maximumFPS=60;
     void run();
 public:
     ~WallpaperMedia(){stop();}
@@ -23,5 +23,6 @@ public:
     void clear();
     void enable(bool value);
     void setActive(bool value);
+    void setFrameRate(int fps);
     WallpaperState snapshot();
 };

@@ -127,7 +127,7 @@ struct EngineWallpaper::Impl {
                 ownedTitle.clear();
             }if(watch){SetEvent(watch);CloseHandle(watch);watch=nullptr;}if(owner){CloseHandle(owner);owner=nullptr;}source=nullptr;};
         for(;;){std::wstring exe,path;bool use=false,enabled=false,lookup=false,sync=false;uint64_t generation;
-            {std::unique_lock lock(mutex);wake.wait_for(lock,std::chrono::milliseconds(100));if(stopping)break;exe=executable;path=file;generation=revision;enabled=state.enabled;use=active&&enabled;lookup=current;current=false;sync=follow&&use&&GetTickCount64()>=poll;}
+            {std::unique_lock lock(mutex);if(!state.enabled&&!current&&revision==applied)wake.wait(lock,[&]{return stopping||state.enabled||current||revision!=applied;});else wake.wait_for(lock,std::chrono::milliseconds(100));if(stopping)break;exe=executable;path=file;generation=revision;enabled=state.enabled;use=active&&enabled;lookup=current;current=false;sync=follow&&use&&GetTickCount64()>=poll;}
             if(generation!=applied||!enabled){close();std::lock_guard lock(mutex);state.window=nullptr;state.loading=use;applied=generation;attempts=0;retry=0;}
             DWORD actualPid=0;if(source)GetWindowThreadProcessId(source,&actualPid);
             if(source&&(!IsWindow(source)||!owner||actualPid!=GetProcessId(owner)||WaitForSingleObject(owner,0)!=WAIT_TIMEOUT)){close();std::lock_guard lock(mutex);state.window=nullptr;}

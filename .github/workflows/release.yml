@@ -1,54 +1,42 @@
-name: Windows release
+name: 0.20.3
 on:
   push:
     branches: [main]
-    paths: [VERSION, src/**, build.ps1, package.ps1, .github/workflows/release.yml]
+    paths: [VERSION]
   workflow_dispatch:
 permissions:
-  contents: write
+  contents: read
 concurrency:
   group: windows-release
-  cancel-in-progress: true
+  cancel-in-progress: false
 jobs:
   release:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(tr -d '\r\n' < VERSION)"
+          test "$version" = "0.20.3"
+          gh release create "$version" --target "$GITHUB_SHA" --title "$version" --notes "$version" --latest
+  build:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: windows-2022
     timeout-minutes: 40
     defaults:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Build
-        run: ./build.ps1
-      - name: Package
         run: ./package.ps1
-      - name: Publish
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $head = git ls-remote origin refs/heads/main
-          if ($LASTEXITCODE -ne 0 -or ($head -split '\s+')[0] -ne $env:GITHUB_SHA) { throw 'A newer commit is awaiting publication.' }
-          $version = (Get-Content VERSION -Raw).Trim()
-          $archive = "dist/Island-$version-win-x64.zip"
-          $tag = "v$version"
-          gh release view $tag --json id 2>$null
-          if ($LASTEXITCODE -eq 0) {
-            $oldTag = git ls-remote --tags origin "refs/tags/$tag"
-            if ($LASTEXITCODE -ne 0 -or -not $oldTag) { throw 'Cannot verify existing release tag.' }
-            $oldSha = ($oldTag -split '\s+')[0]
-            gh release edit $tag --draft=true
-            if ($LASTEXITCODE -ne 0) { throw 'Cannot prepare release replacement.' }
-            gh release upload $tag $archive "$archive.sha256" --clobber
-            if ($LASTEXITCODE -ne 0) { throw 'Replacement upload failed.' }
-            git tag --force $tag $env:GITHUB_SHA
-            if ($LASTEXITCODE -ne 0) { throw 'Cannot prepare updated tag.' }
-            git push origin "refs/tags/$tag" "--force-with-lease=refs/tags/${tag}:$oldSha"
-            if ($LASTEXITCODE -ne 0) { throw 'Release tag changed concurrently.' }
-            gh release edit $tag --title "Island $version" --notes-file RELEASE_NOTES.md
-            if ($LASTEXITCODE -ne 0) { throw 'Cannot update release notes.' }
-          } else {
-            gh release create $tag $archive "$archive.sha256" --target $env:GITHUB_SHA --title "Island $version" --notes-file RELEASE_NOTES.md --draft
-            if ($LASTEXITCODE -ne 0) { throw 'Release upload failed.' }
-          }
-          gh release edit "v$version" --draft=false --latest
-          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed.' }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: 0.20.3
+          path: dist/Island-Setup-0.20.3-Win10-11-x64-InternalSettings.exe
+          if-no-files-found: error

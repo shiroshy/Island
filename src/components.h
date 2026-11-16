@@ -19,6 +19,7 @@ void setWindowsFileManager(bool enabled);
 size_t fileBrowserWindowCount();
 HWND lastFileBrowserWindow();
 void componentFilesDisplayChanged();
+bool componentSelfTest();
 
 class DesktopProcess {
     struct Impl;
@@ -35,6 +36,8 @@ public:
     int analysisRate()const;
     void refreshFiles();
     void appearance();
+    bool setting(const island_settings::Packet& packet);
     void audioFrame();
     DWORD processId()const;
+    bool ready()const;
 };

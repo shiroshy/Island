@@ -177,10 +177,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             args.push_back(value);
             args.push_back(profile);
         } else {
-            args.push_back(value);
+            args.push_back(value == L"--standalone" ? L"--integrated" : value);
             if (value == L"--standalone" || value == L"--integrated")
                 explicitMode = true;
-            if (value == L"--quit" || value == L"--collapse" || value == L"--notify")
+            if (value == L"--quit" || value == L"--status" || value == L"--collapse" || value == L"--notify" ||
+                value == L"--self-test")
                 commandOnly = true;
         }
     }
@@ -208,9 +209,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         return 0;
     }
     if (!explicitMode && !commandOnly)
-        args.push_back(GetPrivateProfileIntW(L"shell", L"standalone", 1, (profile + L"\\settings.ini").c_str())
-                           ? L"--standalone"
-                           : L"--integrated");
+        args.push_back(L"--integrated");
     std::wstring command = quote(executable);
     for (auto &arg : args)
         command += L" " + quote(arg);
@@ -243,6 +242,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         HANDLE handles[] = {ready, child.hProcess};
         DWORD outcome = WaitForMultipleObjects(2, handles, FALSE, commandOnly ? 15000 : timeout);
         bool done = outcome == WAIT_OBJECT_0;
+        if(done&&!commandOnly){HWND current=FindWindowW(L"OwnIsland.Surface",nullptr);done=current&&owned(current,executable)&&GetPropW(current,L"OwnIsland.ShellReady");if(!done)failure=ERROR_NOT_READY;}
         if (outcome == WAIT_OBJECT_0 + 1) {
             DWORD code = 1;
             GetExitCodeProcess(child.hProcess, &code);
@@ -292,7 +292,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             auto deadline = GetTickCount64() + 12000;
             while (GetTickCount64() < deadline) {
                 HWND replacement = FindWindowW(L"OwnIsland.Surface", nullptr);
-                if (replacement && owned(replacement, executable) && GetPropW(replacement, L"OwnIsland.StartupReady")) {
+                if (replacement && owned(replacement, executable) && GetPropW(replacement, L"OwnIsland.StartupReady") && GetPropW(replacement, L"OwnIsland.ShellReady")) {
                     log(L"guard-recovered");
                     return 0;
                 }

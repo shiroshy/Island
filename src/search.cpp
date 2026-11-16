@@ -177,7 +177,6 @@ bool searchOpen(HWND owner,const SearchResult& item,bool administrator){
     SHELLEXECUTEINFOW execute{sizeof(execute)};execute.hwnd=owner;execute.fMask=SEE_MASK_FLAG_NO_UI;execute.lpVerb=administrator?L"runas":L"open";execute.lpFile=path.c_str();execute.lpParameters=args.empty()?nullptr:args.c_str();execute.lpDirectory=item.workingDirectory.empty()?nullptr:item.workingDirectory.c_str();execute.nShow=SW_SHOWNORMAL;{DWORD attrs=GetFileAttributesW(item.target.c_str());if(item.directory||(attrs!=INVALID_FILE_ATTRIBUTES&&(attrs&FILE_ATTRIBUTE_DIRECTORY)))return openFileBrowser(item.target);if(!_wcsicmp(std::filesystem::path(item.target).filename().c_str(),L"explorer.exe"))return openFileBrowser();}return ShellExecuteExW(&execute)!=FALSE;
 }
 bool searchLocation(const SearchResult& item){if(StandaloneMode)return !item.path.starts_with(L"shell:")&&openFileLocation(item.path);if(item.path.starts_with(L"shell:"))return false;PIDLIST_ABSOLUTE id=nullptr;if(FAILED(SHParseDisplayName(item.path.c_str(),nullptr,&id,0,nullptr)))return false;HRESULT hr=SHOpenFolderAndSelectItems(id,0,nullptr,0);CoTaskMemFree(id);return SUCCEEDED(hr);}
-
-
+bool searchSelfTest(){return fold(L"БЛОКНОТ ЁЖ")==L"блокнот ёж"&&containsWords(L"test's report_2026.txt")==L"\"test*\" AND \"s*\" AND \"report*\" AND \"2026*\" AND \"txt*\""&&containsWords(L"' OR 1=1 --")==L"\"OR*\" AND \"1*\" AND \"1*\"";}
 
 SearchState searchFolder(const std::wstring& query,const std::wstring& folder){SearchState state;state.query=query;state.indexError=indexFiles(query,state.results,folder);return state;}

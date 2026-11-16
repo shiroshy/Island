@@ -39,7 +39,7 @@ public:
 };
 bool searchOpen(HWND owner,const SearchResult& item,bool administrator=false);
 bool searchLocation(const SearchResult& item);
-
+bool searchSelfTest();
 SearchState searchOnce(const std::wstring& text,const std::vector<std::wstring>& sources={});
 
 SearchState searchFolder(const std::wstring& query,const std::wstring& folder);

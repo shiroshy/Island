@@ -12,6 +12,9 @@
 #include "wallpaper_engine.h"
 #include "widget_image.h"
 #include "widget_geometry.h"
+#include "settings_ui.h"
+#include "settings_transport.h"
+#include "frames.h"
 #include <windowsx.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -25,6 +28,7 @@
 #include <numeric>
 
 namespace {
+double desktopMilliseconds(){static double scale=[] {LARGE_INTEGER f{};QueryPerformanceFrequency(&f);return 1000.0/f.QuadPart;}();LARGE_INTEGER now{};QueryPerformanceCounter(&now);return now.QuadPart*scale;}
 constexpr wchar_t DeskClass[]=L"OwnIsland.Desktop";
 constexpr wchar_t BackdropClass[]=L"OwnIsland.DesktopBackdrop";
 constexpr wchar_t HostClass[]=L"OwnIsland.DesktopHost";
@@ -91,13 +95,13 @@ struct Desktop::Impl {
     AudioMeter* audio=nullptr;
     std::function<DesktopData()> snapshot;
     std::function<void(int,const std::wstring&)> action;
-    std::vector<std::unique_ptr<View>> views;
+    std::vector<std::unique_ptr<View>> views,retiringViews;
     std::mutex mutex;std::condition_variable wake;std::thread worker;
-    bool stopping=false,dirty=true,rebuilding=false,displayDirty=false;
+    bool stopping=false,dirty=true,rebuilding=false,displayDirty=false,catalogReady=false;
     std::vector<std::wstring> pinned,extraFiles;
     std::shared_ptr<const Catalog> catalog=std::make_shared<Catalog>();
     std::wstring ini=stateDirectory()+L"\\settings.ini";
-    bool activeAudio=false;int spectrumMode=0,eqFPS=30,eqBands=48;float gain=1;bool eqEnabled=true,eqSmooth=true,eqPeaks=true;
+    bool activeAudio=false;int spectrumMode=0,eqFPS=60,eqBands=48;float gain=1;bool eqEnabled=true,eqSmooth=true,eqPeaks=true;
     ULONGLONG statsTick=0,previousIdle=0,previousKernel=0,previousUser=0;float cpuUsage=0;
     void stats(){auto now=GetTickCount64();if(now-statsTick<1000)return;statsTick=now;FILETIME idle{},kernel{},user{};if(GetSystemTimes(&idle,&kernel,&user)){auto number=[](FILETIME f){return ((ULONGLONG)f.dwHighDateTime<<32)|f.dwLowDateTime;};auto i=number(idle),k=number(kernel),u=number(user),total=k-previousKernel+u-previousUser;if(previousKernel&&total)cpuUsage=std::clamp(100.f*(1.f-(i-previousIdle)/(float)total),0.f,100.f);previousIdle=i;previousKernel=k;previousUser=u;}}
     void saveEQ(){for(auto pair:{std::pair{L"spectrum",spectrumMode},std::pair{L"eq-fps",eqFPS},std::pair{L"eq-bands",eqBands},std::pair{L"eq-enabled",eqEnabled?1:0},std::pair{L"eq-smooth",eqSmooth?1:0},std::pair{L"eq-peaks",eqPeaks?1:0}})WritePrivateProfileStringW(L"desktop",pair.first,std::to_wstring(pair.second).c_str(),ini.c_str());WritePrivateProfileStringW(L"desktop",L"gain",std::to_wstring(gain).c_str(),ini.c_str());}
@@ -131,7 +135,7 @@ struct Desktop::Impl::View {
     std::array<int,WidgetCount> order{},savedOrder{};
     std::wstring layoutSection;
     bool arranging=false,savedShadow=false;int grid=16,savedGrid=16,savedPage=0,dragWidget=-1,selectedWidget=-1,renderingWidget=-1;
-    int eqMode=0,eqFPS=30,eqBands=48;float eqGain=1;bool eqEnabled=true,eqSmooth=true,eqPeaks=true,eqNumbers=true;
+    int eqMode=0,eqFPS=60,eqBands=48;float eqGain=1;bool eqEnabled=true,eqSmooth=true,eqPeaks=true,eqNumbers=true;
     WidgetImageMedia imageMedia;WidgetImageState imageState;
     EngineWallpaper engineWallpaper;EngineWallpaperState engineState;HWND lastEngineWindow=nullptr;bool awaitingLocalWallpaper=false,localWallpaperError=false;
     void engineMenu();
@@ -158,11 +162,12 @@ struct Desktop::Impl::View {
     std::shared_ptr<const PixelImage> wallpaper;
     bool photo=false,wallLoading=false,motion=false,musicOver=false,seekDragging=false;float seekRatio=0;
     std::wstring wallName,wallError;
-    ULONGLONG animation=0,lastFrame=0,lastDraw=0,clockTick=0,lastVisibility=0;
+    ULONGLONG animation=0,lastDraw=0,clockTick=0,lastVisibility=0;
+    double lastFrame=0;Frames frameClock;
     UINT surfaceWidth=0,surfaceHeight=0;
     std::array<float,48> levels{},peaks{};SpectrumFrame spectrum;
     View(Impl* p):parent(p){std::iota(order.begin(),order.end(),0);}
-    ~View(){engineWallpaper.stop();if(IsWindow(hwnd))DestroyWindow(hwnd);if(IsWindow(backdrop))DestroyWindow(backdrop);if(font)DeleteObject(font);if(timerFont)DeleteObject(timerFont);if(brush)DeleteObject(brush);if(noteMask)DeleteObject(noteMask);if(timerMask)DeleteObject(timerMask);}
+    ~View(){frameClock.update(false);engineWallpaper.stop();if(IsWindow(hwnd))DestroyWindow(hwnd);if(IsWindow(backdrop))DestroyWindow(backdrop);if(font)DeleteObject(font);if(timerFont)DeleteObject(timerFont);if(brush)DeleteObject(brush);if(noteMask)DeleteObject(noteMask);if(timerMask)DeleteObject(timerMask);}
     Box box(float x,float y,float w,float h)const{return {left+x,top+y,w,h};}
     Box appearanceBounds()const{return box(1190,86,410,716);}
     Box equalizerBounds()const{return {(width-454)/2,std::max(50.f,(height-748)/2),454,748};}
@@ -174,7 +179,7 @@ struct Desktop::Impl::View {
     void button(Box b,const wchar_t* glyph,const std::wstring& text,std::function<void()> click,bool selected=false,bool enabled=true){bool over=enabled&&hover==(int)hits.size();gfx->fill(b,!enabled?blend(data.background,data.card,.55f):selected?blend(data.card,data.accent,.24f):over?data.hover:data.card,12);if(glyph)gfx->icon(glyph,{b.x+9,b.y,25,b.h},15,!enabled?blend(data.card,data.muted,.6f):selected?data.accent:data.muted);label(text,{b.x+(glyph?42:12),b.y,b.w-(glyph?52:24),b.h},12,enabled?data.ink:blend(data.card,data.muted,.7f));if(enabled)add(b,std::move(click));else add(b,[]{},-1);}
     void iconButton(Box b,const wchar_t* glyph,std::function<void()> click){if(hover==(int)hits.size())gfx->fill(b,data.hover,12);gfx->icon(glyph,b,17,data.muted);add(b,std::move(click));}
     void dockControl(Box b,bool plus,std::function<void()> click){if(hover==(int)hits.size())gfx->fill(b,data.hover,12);float cx=b.x+b.w/2,cy=b.y+b.h/2;if(plus){gfx->line(cx-9,cy,cx+9,cy,data.muted,1.2f);gfx->line(cx,cy-9,cx,cy+9,data.muted,1.2f);}else for(int i=-1;i<=1;i++){gfx->fill({cx-8,cy+i*6-1,2,2},data.muted);gfx->line(cx-3,cy+i*6,cx+8,cy+i*6,data.muted,1.2f);}add(b,std::move(click));}
-    void resize();void draw();void pulse(bool force=false);void editors(bool show);void context(POINT position);void dragFile(const std::wstring& path);void clock();void apps();void weather();void music();void spectrumWidget();void notes();void timerWidget();void files();void tasks();void wallpaperControls();void background();
+    void resize();void draw(bool preparing=false);void pulse(bool force=false,bool scheduled=false);void editors(bool show);void context(POINT position);void dragFile(const std::wstring& path);void clock();void apps();void weather();void music();void spectrumWidget();void notes();void timerWidget();void files();void tasks();void wallpaperControls();void background();
     static LRESULT CALLBACK inputProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp);
 };
 
@@ -191,7 +196,7 @@ void Desktop::Impl::run(){
         std::stable_sort(paths.begin(),paths.end(),[](auto& a,auto& b){bool x=(GetFileAttributesW(a.c_str())&FILE_ATTRIBUTE_DIRECTORY)!=0,y=(GetFileAttributesW(b.c_str())&FILE_ATTRIBUTE_DIRECTORY)!=0;return x!=y?x>y:_wcsicmp(a.c_str(),b.c_str())<0;});
         for(auto& path:paths)next->files.push_back(load(path));
         if(cache.size()>384){std::set<std::wstring> keep;for(auto& e:next->files)keep.insert(e.path);for(auto& e:next->apps)keep.insert(e.first);for(auto it=cache.begin();it!=cache.end();)if(!keep.contains(it->first))it=cache.erase(it);else ++it;}
-        {std::lock_guard lock(mutex);catalog=next;}
+        {std::lock_guard lock(mutex);catalog=next;catalogReady=true;}
         PostMessageW(owner,WM_APP+13,0,0);
     }CoUninitialize();
 }
@@ -232,7 +237,7 @@ void Desktop::Impl::View::renderWidget(int id){
     if(place.shadow&&id!=Clock){for(int d=12;d>=2;d-=2)gfx->fill({a.x-d*.4f,a.y+4-d*.2f,a.w+d*.8f,a.h+d*.4f},0,24+d*.2f,.025f,false);}
     if(place.background){suppressPanel=false;panel(a);}suppressPanel=true;
     if(id==Navigation){const wchar_t* pages[]={L"Главная",L"Файлы",L"Окна"};float gap=6,pad=8;for(int i=0;i<3;i++){Box b=place.vertical?Box{a.x+pad,a.y+pad+i*(a.h-2*pad+gap)/3,a.w-2*pad,(a.h-2*pad-2*gap)/3}:Box{a.x+pad+i*(a.w-2*pad+gap)/3,a.y+6,(a.w-2*pad-2*gap)/3,a.h-12};if(page==i)gfx->fill(b,data.accent,12,.16f);label(pages[i],b,12,page==i?data.accent:data.muted,page==i,DWRITE_TEXT_ALIGNMENT_CENTER);add(b,[this,i]{page=i;selectedFile=-1;hover=-1;draw();});}}
-    else if(id==Controls){const wchar_t* icons[]={L"\uE70F",L"\uE721",L"\uE790",data.mutedAudio?L"\uE74F":L"\uE767",networkGlyph(data.network)};float extent=place.vertical?a.h:a.w,step=(extent-8)/5,side=std::min(44.f,step-4);for(int i=0;i<5;i++){Box b=place.vertical?Box{a.x+(a.w-side)/2,a.y+4+i*step+(step-side)/2,side,side}:Box{a.x+4+i*step+(step-side)/2,a.y+(a.h-side)/2,side,side};iconButton(b,icons[i],[this,i]{if(i==0)beginArrange();if(i==1)parent->invoke(DeskSearch);if(i==2){appearance=!appearance;eqSettings=false;draw();}if(i==3)parent->invoke(DeskToggleMute);if(i==4)openTarget(L"ms-settings:network");});}}
+    else if(id==Controls){const wchar_t* icons[]={L"\uE70F",L"\uE721",L"\uE790",data.mutedAudio?L"\uE74F":L"\uE767",networkGlyph(data.network)};float extent=place.vertical?a.h:a.w,step=(extent-8)/5,side=std::min(44.f,step-4);for(int i=0;i<5;i++){Box b=place.vertical?Box{a.x+(a.w-side)/2,a.y+4+i*step+(step-side)/2,side,side}:Box{a.x+4+i*step+(step-side)/2,a.y+(a.h-side)/2,side,side};iconButton(b,icons[i],[this,i]{if(i==0)beginArrange();if(i==1)parent->invoke(DeskSearch);if(i==2)openSystemSettings(L"Island_SettingsDesktop");if(i==3)parent->invoke(DeskToggleMute);if(i==4)openTarget(L"ms-settings:network");});}}
     else if(id==Apps)apps();else if(id==Spectrum)spectrumWidget();else{
         drawK=std::min(a.w/base.w,a.h/base.h);drawX=a.x+(a.w-base.w*drawK)/2-base.x*drawK;drawY=a.y+(a.h-base.h*drawK)/2-base.y*drawK;gfx->transform(D2D1::Matrix3x2F::Scale(drawK,drawK)*D2D1::Matrix3x2F::Translation(drawX,drawY)*rotated);
         if(id==Clock){gfx->shadowEnabled=place.shadow;clock();gfx->shadowEnabled=false;}else if(id==Weather)weather();else if(id==Music)music();else if(id==Tools)notes();else if(id==Files)files();else if(id==Windows)tasks();else if(id==Calendar)calendarWidget();else if(id==Timer){label(L"Таймер",box(1264,521,300,30),18,0,true);timerWidget();}else if(id==System)systemWidget();else if(id==Folders)foldersWidget();else if(id==Image)imageWidget();
@@ -433,12 +438,12 @@ void Desktop::Impl::View::wallpaperControls(){
     button(box(1214,757,174,31),nullptr,L"Дата",[this]{clockAlignMenu();},false,layout[Clock].shown);button(box(1400,757,174,31),L"\uE73E",L"Готово",[this]{appearance=false;draw();});
 }
 
-void Desktop::Impl::View::draw(){
-    if(!gfx||!IsWindow(hwnd)||(lastDraw&&!visible&&!arranging))return;
+void Desktop::Impl::View::draw(bool preparing){
+    if(!gfx||!IsWindow(hwnd)||(lastDraw&&!visible&&!arranging&&!preparing))return;
     SetPropW(hwnd,L"OwnIsland.Editing",(HANDLE)(UINT_PTR)arranging);SetPropW(hwnd,L"OwnIsland.ClockShadow",(HANDLE)(UINT_PTR)layout[Clock].shadow);
     for(int id=0;id<WidgetCount;id++){auto b=bounds(id);auto prefix=L"OwnIsland.Widget"+std::to_wstring(id);SetPropW(hwnd,(prefix+L"X").c_str(),(HANDLE)(INT_PTR)(int)b.x);SetPropW(hwnd,(prefix+L"Y").c_str(),(HANDLE)(INT_PTR)(int)b.y);SetPropW(hwnd,(prefix+L"Visible").c_str(),(HANDLE)(UINT_PTR)layout[id].shown);SetPropW(hwnd,(prefix+L"W").c_str(),(HANDLE)(INT_PTR)(int)b.w);SetPropW(hwnd,(prefix+L"H").c_str(),(HANDLE)(INT_PTR)(int)b.h);SetPropW(hwnd,(prefix+L"Vertical").c_str(),(HANDLE)(UINT_PTR)layout[id].vertical);SetPropW(hwnd,(prefix+L"Angle").c_str(),(HANDLE)(INT_PTR)(int)layout[id].angle);}
 
-    auto stamp=GetTickCount64();data=parent->snapshot();{std::lock_guard lock(parent->mutex);catalog=parent->catalog;}auto media=parent->media.snapshot();wallpaper=media.image;photo=media.enabled;wallLoading=media.loading;motion=media.enabled&&media.video;wallError=media.error;wallName=media.name;imageState=imageMedia.snapshot();engineState=engineWallpaper.snapshot();
+    auto stamp=GetTickCount64();bool catalogReady=false;data=parent->snapshot();{std::lock_guard lock(parent->mutex);catalog=parent->catalog;catalogReady=parent->catalogReady;}auto media=parent->media.snapshot();wallpaper=media.image;photo=media.enabled;wallLoading=media.loading;motion=media.enabled&&media.video;wallError=media.error;wallName=media.name;imageState=imageMedia.snapshot();engineState=engineWallpaper.snapshot();
     float elapsed=animation?std::clamp((stamp-animation)/620.f,0.f,1.f):1,ease=1-std::pow(1-elapsed,4.f);bool animating=elapsed<1;
     gfx->outlineColor=data.outline;gfx->outlineWidth=data.outlineWidth;gfx->outlineSmooth=data.outlineSmooth;gfx->begin();hits.clear();background();
     float revealWidth=240+(width-240)*ease;gfx->clip({(width-revealWidth)/2,0,revealWidth,36+(height-36)*ease});gfx->layer(ease,0,-24*(1-ease));
@@ -453,25 +458,26 @@ void Desktop::Impl::View::draw(){
     if(eqSettings)eqControls();renderingWidget=-1;
     gfx->endLayer();gfx->unclip();
     bool ok=gfx->end();lastDraw=stamp;SetPropW(hwnd,L"OwnIsland.DesktopFrames",(HANDLE)((UINT_PTR)GetPropW(hwnd,L"OwnIsland.DesktopFrames")+1));
-    if(!ok){gfx.reset();PostMessageW(hwnd,WM_APP+20,0,0);return;}
+    if(!ok){RemovePropW(hwnd,L"OwnIsland.DesktopPrepared");gfx.reset();PostMessageW(hwnd,WM_APP+20,0,0);return;}
+    if(catalogReady&&!wallLoading&&(!layout[Image].shown||!imageState.loading)&&!engineState.loading&&(!engineState.enabled||engineState.window||!engineState.error.empty()))SetPropW(hwnd,L"OwnIsland.DesktopPrepared",(HANDLE)1);
     unsigned card=inputColor();COLORREF color=RGB((card>>16)&255,(card>>8)&255,card&255);LOGBRUSH current{};if(!brush||!GetObjectW(brush,sizeof(current),&current)||current.lbColor!=color){if(brush)DeleteObject(brush);brush=CreateSolidBrush(color);if(note)InvalidateRect(note,nullptr,TRUE);if(timer)InvalidateRect(timer,nullptr,TRUE);}
     editors(visible&&!animating);
 }
-void Desktop::Impl::View::pulse(bool force){
+void Desktop::Impl::View::pulse(bool force,bool scheduled){
     auto stamp=GetTickCount64();data=parent->snapshot();
     bool resumed=false;if(force||stamp-lastVisibility>=100){bool now=data.awake&&IsWindowVisible(hwnd)&&!monitorBlocked(monitor)&&exposed(monitor);resumed=now&&!visible;visible=now;lastVisibility=stamp;SetPropW(hwnd,L"OwnIsland.DesktopPaused",(HANDLE)(UINT_PTR)(visible?0:1));}
-    if(resumed){lastFrame=stamp;lastDraw=0;}
+    if(resumed){lastFrame=0;lastDraw=0;}
     if(awaitingLocalWallpaper){auto local=parent->media.snapshot();if(!local.loading){awaitingLocalWallpaper=false;localWallpaperError=!local.error.empty();if(local.image&&!localWallpaperError)engineWallpaper.disable();}}
     engineWallpaper.setActive(visible&&data.performance.video);if(!visible||!data.performance.video)RemovePropW(hwnd,L"OwnIsland.EngineSource");engineState=engineWallpaper.snapshot();
     SetPropW(hwnd,L"OwnIsland.EngineAnchor",backdrop);SetPropW(hwnd,L"OwnIsland.EngineRetained",engineState.window);SetPropW(hwnd,L"OwnIsland.EngineLoading",(HANDLE)(UINT_PTR)engineState.loading);
     if(engineState.window!=lastEngineWindow){lastEngineWindow=engineState.window;if(lastEngineWindow)SetWindowPos(hwnd,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_NOOWNERZORDER);}
-    imageMedia.setActive(visible&&page==0&&layout[Image].shown&&data.performance.video,data.performance.desktopFPS);if(!visible){if(timerInterval!=250){timerInterval=250;SetTimer(hwnd,1,timerInterval,nullptr);}editors(false);return;}
+    imageMedia.setActive(visible&&page==0&&layout[Image].shown&&data.performance.video,data.performance.desktopFPS);if(!visible){frameClock.update(false);SetPropW(hwnd,L"OwnIsland.FrameClockFPS",nullptr);if(timerInterval!=250){timerInterval=250;SetTimer(hwnd,1,timerInterval,nullptr);}bool catalogPrepared=false;{std::lock_guard lock(parent->mutex);catalogPrepared=parent->catalogReady;}if(!GetPropW(hwnd,L"OwnIsland.DesktopPrepared")&&catalogPrepared&&!parent->media.snapshot().loading&&(!layout[Image].shown||!imageMedia.snapshot().loading)&&!engineState.loading&&(!engineState.enabled||engineState.window||!engineState.error.empty()))draw(true);editors(false);return;}
     bool animating=animation&&stamp-animation<620;
-    if(parent->audio)spectrum=parent->audio->spectrum();if(!eqEnabled||!layout[Spectrum].shown)spectrum={};if(layout[System].shown)parent->stats();float dt=lastFrame?std::clamp((stamp-lastFrame)/1000.f,0.f,.1f):.016f;lastFrame=stamp;
+    if(parent->audio)spectrum=parent->audio->spectrum();if(!eqEnabled||!layout[Spectrum].shown)spectrum={};if(layout[System].shown)parent->stats();double frameTime=desktopMilliseconds();float dt=lastFrame?(float)std::clamp((frameTime-lastFrame)/1000.0,0.0,.1):.016f;lastFrame=frameTime;
     bool changing=false;for(int i=0;i<48;i++){float target=spectrum.bars[i];float old=levels[i];levels[i]=eqSmooth?levels[i]+(target-levels[i])*(1-std::exp(-dt*(target>levels[i]?25:7))):target;peaks[i]=std::max(levels[i],peaks[i]-dt*.35f);changing|=std::abs(old-levels[i])>.0002f;}
-    imageState=imageMedia.snapshot();motion=data.performance.video&&(engineState.enabled||parent->media.snapshot().video||(layout[Image].shown&&imageState.animated));int fps=std::min(data.performance.desktopFPS,eqFPS);int interval=animating?16:motion?1000/data.performance.desktopFPS:changing||spectrum.rms>.00015f?1000/fps:100;if(interval!=timerInterval){timerInterval=interval;SetTimer(hwnd,1,timerInterval,nullptr);}
-    auto seconds=stamp/1000;bool tick=clockTick!=seconds;clockTick=seconds;
-    if((force||resumed||animating||motion||changing||spectrum.rms>.00015f||tick)&&(force||resumed||animating||stamp-lastDraw>=(ULONGLONG)(1000/(motion?data.performance.desktopFPS:fps))))draw();
+    imageState=imageMedia.snapshot();motion=data.performance.video&&(engineState.enabled||parent->media.snapshot().video||(layout[Image].shown&&imageState.animated));int fps=std::min(data.performance.desktopFPS,eqFPS);bool continuous=animating||motion||changing||(page==0&&eqEnabled&&layout[Spectrum].shown);int clockFPS=animating?60:motion?data.performance.desktopFPS:fps;frameClock.update(continuous,clockFPS);SetPropW(hwnd,L"OwnIsland.FrameClockFPS",(HANDLE)(UINT_PTR)(continuous?clockFPS:0));if(timerInterval!=100){timerInterval=100;SetTimer(hwnd,1,100,nullptr);}
+    auto seconds=stamp/1000;bool tick=clockTick!=seconds;
+    if((force||resumed||scheduled||(!continuous&&tick))&&(force||resumed||animating||motion||changing||spectrum.rms>.00015f||tick)){draw();clockTick=seconds;}
 }
 void Desktop::Impl::View::dragFile(const std::wstring& path){
     PIDLIST_ABSOLUTE id=nullptr;if(FAILED(SHParseDisplayName(path.c_str(),nullptr,&id,0,nullptr)))return;
@@ -493,14 +499,15 @@ void Desktop::Impl::View::context(POINT position){
     if(result==5)parent->invoke(DeskUnpinApp,path);if(result==6)parent->invoke(DeskPinApp,path);
     if(result==7){{std::lock_guard lock(parent->mutex);std::erase(parent->extraFiles,path);}parent->saveFiles();parent->refresh();}
     if(result==10)parent->invoke(DeskSearch);if(result==11)parent->invoke(DeskAddApp);if(result==12)openTarget(knownFolder(FOLDERID_Desktop));if(result==13)parent->refresh();if(result==14)parent->invoke(DeskSettings);if(result==15)openTarget(L"taskmgr.exe");
-    if(result==16)appearance=true;if(result==17)beginArrange();
+    if(result==16)openSystemSettings(L"Island_SettingsDesktop");if(result==17)beginArrange();
     if(result>=20&&result<=22){eqMode=result-20;WritePrivateProfileStringW(L"desktop",L"spectrum",std::to_wstring(eqMode).c_str(),parent->ini.c_str());}
     if(result==23||result==24){eqGain=result==23?1:1.5f;WritePrivateProfileStringW(L"desktop",L"gain",result==23?L"1":L"1.5",parent->ini.c_str());}draw();
 }
 LRESULT CALLBACK Desktop::Impl::proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     auto v=(View*)GetWindowLongPtrW(hwnd,GWLP_USERDATA);if(msg==WM_NCCREATE){v=(View*)((CREATESTRUCTW*)lp)->lpCreateParams;v->hwnd=hwnd;SetWindowLongPtrW(hwnd,GWLP_USERDATA,(LONG_PTR)v);}if(!v)return DefWindowProcW(hwnd,msg,wp,lp);
     switch(msg){
-    case WM_CREATE:DragAcceptFiles(hwnd,TRUE);SetTimer(hwnd,1,33,nullptr);return 0;
+    case WM_CREATE:DragAcceptFiles(hwnd,TRUE);v->frameClock.start(hwnd);SetTimer(hwnd,1,33,nullptr);return 0;
+    case WM_APP+3:v->frameClock.received();v->pulse(false,true);return 0;
     case WM_PAINT:{PAINTSTRUCT ps;BeginPaint(hwnd,&ps);EndPaint(hwnd,&ps);v->draw();return 0;}
     case WM_ERASEBKGND:return 1;
     case WM_MOUSEACTIVATE:return MA_NOACTIVATE;
@@ -524,12 +531,12 @@ LRESULT CALLBACK Desktop::Impl::proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_COMMAND:if(LOWORD(wp)==201&&!v->editing){if(HIWORD(wp)==EN_CHANGE){v->noteDirty=true;SetTimer(hwnd,2,500,nullptr);}if(HIWORD(wp)==EN_KILLFOCUS&&v->noteDirty){KillTimer(hwnd,2);v->parent->invoke(DeskSaveNote,textOf(v->note));v->noteDirty=false;}}if(LOWORD(wp)==202&&HIWORD(wp)==EN_KILLFOCUS&&!v->editing&&!v->data.timerRunning&&!v->data.timerPaused)v->parent->invoke(DeskSetTimer,textOf(v->timer));return 0;
     case WM_CTLCOLOREDIT:{SetTextColor((HDC)wp,RGB((v->data.ink>>16)&255,(v->data.ink>>8)&255,v->data.ink&255));unsigned color=v->inputColor();SetBkColor((HDC)wp,RGB((color>>16)&255,(color>>8)&255,color&255));return (LRESULT)v->brush;}
     case WM_APP+20:v->resize();return 0;
-    case WM_DESTROY:if(v->note&&v->noteDirty)v->parent->invoke(DeskSaveNote,textOf(v->note));KillTimer(hwnd,1);KillTimer(hwnd,2);v->hwnd=nullptr;return 0;
+    case WM_DESTROY:v->frameClock.update(false);if(v->note&&v->noteDirty)v->parent->invoke(DeskSaveNote,textOf(v->note));KillTimer(hwnd,1);KillTimer(hwnd,2);v->hwnd=nullptr;return 0;
     }
     return DefWindowProcW(hwnd,msg,wp,lp);
 }
 void Desktop::Impl::rebuild(){
-    if(rebuilding)return;auto newHost=StandaloneMode?(IsWindow(host)?host:createIndependentHost()):desktopHost();if(!newHost)return;rebuilding=true;auto oldViews=std::move(views);host=newHost;
+    if(rebuilding)return;auto newHost=StandaloneMode?(IsWindow(host)?host:createIndependentHost()):desktopHost();if(!newHost)return;rebuilding=true;auto oldViews=std::move(views);if(retiringViews.empty())retiringViews=std::move(oldViews);host=newHost;
     std::vector<RECT> monitors;EnumDisplayMonitors(nullptr,nullptr,[](HMONITOR,HDC,LPRECT r,LPARAM p)->BOOL{((std::vector<RECT>*)p)->push_back(*r);return TRUE;},(LPARAM)&monitors);
     for(auto rect:monitors){auto view=std::make_unique<View>(this);view->monitor=rect;view->loadLayout();view->imageMedia.start(view->layoutSection);POINT position{rect.left,rect.top};MapWindowPoints(nullptr,host,&position,1);
         auto previous=SetThreadDpiAwarenessContext(GetWindowDpiAwarenessContext(host));
@@ -543,20 +550,20 @@ void Desktop::Impl::rebuild(){
     }
     if(StandaloneMode){SetWindowPos(host,nullptr,GetSystemMetrics(SM_XVIRTUALSCREEN),GetSystemMetrics(SM_YVIRTUALSCREEN),GetSystemMetrics(SM_CXVIRTUALSCREEN),GetSystemMetrics(SM_CYVIRTUALSCREEN),SWP_NOZORDER|SWP_NOACTIVATE|SWP_SHOWWINDOW);}
     keepBelowApplications(host);
-    bool ready=views.size()==monitors.size()&&!views.empty();for(auto& v:views)ready&=v->gfx&&IsWindow(v->backdrop);
-    if(ready)nativeDesktopTakeover(StandaloneMode?desktopHost():host);
+    bool ready=views.size()==monitors.size()&&!views.empty();for(auto& v:views)ready&=v->gfx&&IsWindow(v->backdrop)&&GetPropW(v->hwnd,L"OwnIsland.DesktopPrepared");
+    if(ready){nativeDesktopTakeover(StandaloneMode?desktopHost():host);retiringViews.clear();}
     rebuilding=false;
 }
 void Desktop::Impl::stop(){
     nativeDesktopRelease();
     media.stop();
-    {std::lock_guard lock(mutex);stopping=true;}wake.notify_all();if(worker.joinable())worker.join();views.clear();if(StandaloneMode&&IsWindow(host))DestroyWindow(host);host=nullptr;activeAudio=false;
+    {std::lock_guard lock(mutex);stopping=true;}wake.notify_all();if(worker.joinable())worker.join();retiringViews.clear();views.clear();if(StandaloneMode&&IsWindow(host))DestroyWindow(host);host=nullptr;activeAudio=false;
 }
 Desktop::Desktop()=default;
 Desktop::~Desktop(){stop();}
 void Desktop::start(HWND owner,AudioMeter* audio,std::function<DesktopData()> snapshot,std::function<void(int,const std::wstring&)> action){
     if(impl)return;impl=std::make_unique<Impl>();impl->owner=owner;impl->audio=audio;impl->snapshot=std::move(snapshot);impl->action=std::move(action);impl->pinned=impl->snapshot().pinned;
-    impl->spectrumMode=std::clamp((int)GetPrivateProfileIntW(L"desktop",L"spectrum",0,impl->ini.c_str()),0,7);wchar_t gain[16]={};GetPrivateProfileStringW(L"desktop",L"gain",L"1",gain,16,impl->ini.c_str());impl->gain=std::clamp(wcstof(gain,nullptr),.5f,2.f);impl->eqFPS=std::clamp((int)GetPrivateProfileIntW(L"desktop",L"eq-fps",30,impl->ini.c_str()),5,60);impl->eqBands=GetPrivateProfileIntW(L"desktop",L"eq-bands",48,impl->ini.c_str());if(impl->eqBands!=12&&impl->eqBands!=24)impl->eqBands=48;impl->eqEnabled=GetPrivateProfileIntW(L"desktop",L"eq-enabled",1,impl->ini.c_str())!=0;impl->eqSmooth=GetPrivateProfileIntW(L"desktop",L"eq-smooth",1,impl->ini.c_str())!=0;impl->eqPeaks=GetPrivateProfileIntW(L"desktop",L"eq-peaks",1,impl->ini.c_str())!=0;
+    impl->spectrumMode=std::clamp((int)GetPrivateProfileIntW(L"desktop",L"spectrum",0,impl->ini.c_str()),0,7);wchar_t gain[16]={};GetPrivateProfileStringW(L"desktop",L"gain",L"1",gain,16,impl->ini.c_str());impl->gain=std::clamp(wcstof(gain,nullptr),.5f,2.f);impl->eqFPS=std::clamp((int)GetPrivateProfileIntW(L"desktop",L"eq-fps",60,impl->ini.c_str()),5,60);impl->eqBands=GetPrivateProfileIntW(L"desktop",L"eq-bands",48,impl->ini.c_str());if(impl->eqBands!=12&&impl->eqBands!=24)impl->eqBands=48;impl->eqEnabled=GetPrivateProfileIntW(L"desktop",L"eq-enabled",1,impl->ini.c_str())!=0;impl->eqSmooth=GetPrivateProfileIntW(L"desktop",L"eq-smooth",1,impl->ini.c_str())!=0;impl->eqPeaks=GetPrivateProfileIntW(L"desktop",L"eq-peaks",1,impl->ini.c_str())!=0;
     impl->preset=std::clamp((int)GetPrivateProfileIntW(L"desktop",L"wallpaper-preset",0,impl->ini.c_str()),0,2);impl->placement=std::clamp((int)GetPrivateProfileIntW(L"desktop",L"wallpaper-fit",0,impl->ini.c_str()),0,2);impl->shade=std::clamp((int)GetPrivateProfileIntW(L"desktop",L"wallpaper-shade",28,impl->ini.c_str()),0,75);impl->photo=GetPrivateProfileIntW(L"desktop",L"wallpaper-photo",0,impl->ini.c_str())!=0;
     for(int i=0;i<64;i++){wchar_t path[32768]={};GetPrivateProfileStringW(L"desktop-files",std::to_wstring(i).c_str(),L"",path,32768,impl->ini.c_str());if(*path)impl->extraFiles.push_back(path);}
     WNDCLASSEXW cls={sizeof(cls)};cls.lpfnWndProc=Impl::proc;cls.hInstance=GetModuleHandleW(nullptr);cls.lpszClassName=DeskClass;cls.hCursor=LoadCursorW(nullptr,IDC_ARROW);cls.style=CS_DBLCLKS;RegisterClassExW(&cls);cls.lpszClassName=BackdropClass;cls.lpfnWndProc=backdropProc;cls.style=0;RegisterClassExW(&cls);
@@ -572,19 +579,64 @@ void Desktop::maintain(){
     if(rebuild){bool modal=!IsWindowEnabled(impl->owner);for(auto& view:impl->views)modal|=view->menu;if(modal)return;impl->rebuild();impl->displayDirty=false;}impl->activeAudio=false;
     keepBelowApplications(impl->host);
     auto data=impl->snapshot();
-    bool ready=impl->views.size()==monitors.size()&&!impl->views.empty();for(auto& v:impl->views)ready&=IsWindow(v->hwnd)&&v->gfx&&IsWindow(v->backdrop);
-    if(ready)nativeDesktopTakeover(StandaloneMode?desktopHost():impl->host);
+    bool ready=impl->views.size()==monitors.size()&&!impl->views.empty();for(auto& v:impl->views)ready&=IsWindow(v->hwnd)&&v->gfx&&IsWindow(v->backdrop)&&GetPropW(v->hwnd,L"OwnIsland.DesktopPrepared");
+    SetPropW(impl->owner,L"OwnIsland.DesktopReady",(HANDLE)(UINT_PTR)ready);
+    if(ready){nativeDesktopTakeover(StandaloneMode?desktopHost():impl->host);impl->retiringViews.clear();}
     COLORREF color=RGB((data.background>>16)&255,(data.background>>8)&255,data.background&255);
     for(auto& v:impl->views)if(v->backdrop&&(COLORREF)GetWindowLongPtrW(v->backdrop,GWLP_USERDATA)!=color){SetWindowLongPtrW(v->backdrop,GWLP_USERDATA,color);InvalidateRect(v->backdrop,nullptr,TRUE);}
     {std::lock_guard lock(impl->mutex);if(impl->pinned!=data.pinned){impl->pinned=data.pinned;impl->dirty=true;impl->wake.notify_one();}}
     HWND native=impl->host?FindWindowExW(impl->host,nullptr,L"SHELLDLL_DefView",nullptr):nullptr;
     bool nativeAbove=false;for(HWND child=impl->host?GetWindow(impl->host,GW_CHILD):nullptr;child;child=GetWindow(child,GW_HWNDNEXT)){if(child==native){nativeAbove=true;break;}wchar_t cls[64]={};GetClassNameW(child,cls,64);if(!wcscmp(cls,DeskClass))break;}
     for(auto& v:impl->views){auto asset=v->imageMedia.snapshot();SetPropW(v->hwnd,L"OwnIsland.ImageFrame",(HANDLE)(UINT_PTR)(asset.image?(asset.image->id&0xfffffff):0));if(nativeAbove&&IsWindow(v->hwnd))SetWindowPos(v->hwnd,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_NOREDRAW);v->pulse();impl->activeAudio|=v->visible&&v->page==0&&v->layout[Impl::View::Spectrum].shown&&v->eqEnabled;}
-    bool anyVisible=false;for(auto& v:impl->views)anyVisible|=v->visible&&!v->engineState.window;impl->media.setActive(anyVisible&&data.performance.video);
+    bool anyVisible=false;for(auto& v:impl->views)anyVisible|=v->visible&&!v->engineState.window;impl->media.setFrameRate(data.performance.videoFPS);impl->media.setActive(anyVisible&&data.performance.video);
     SetPropW(impl->owner,L"OwnIsland.DesktopCount",(HANDLE)(UINT_PTR)impl->views.size());SetPropW(impl->owner,L"OwnIsland.DesktopActive",(HANDLE)(UINT_PTR)(impl->activeAudio?1:0));
 }
 void Desktop::reveal(){if(!impl)return;for(auto& v:impl->views){v->animation=GetTickCount64();v->pulse(true);}}
 bool Desktop::needsAudio()const{return impl&&impl->activeAudio;}
 int Desktop::analysisRate()const{int fps=5;if(impl)for(auto& v:impl->views)if(v->visible&&v->page==0&&v->eqEnabled&&v->layout[Impl::View::Spectrum].shown)fps=std::max(fps,v->eqFPS);return fps;}
-void Desktop::appearance(){if(!impl)return;for(auto& v:impl->views)if(v->visible){v->appearance=true;v->draw();break;}}
+void Desktop::appearance(){openSystemSettings(L"Island_SettingsDesktop");}
+bool Desktop::setting(const island_settings::Packet& p){
+    using island_settings::Id;if(!impl||impl->views.empty()||!island_settings::valid(p))return false;
+    HWND owner=(HWND)(UINT_PTR)p.owner;int index=std::clamp(island_settings::settingsMonitorIndex(impl->ini,owner),0,(int)impl->views.size()-1);auto& view=*impl->views[index];
+    if(p.action){
+          view.menu=true;struct MenuReset{bool& value;~MenuReset(){value=false;}} menuReset{view.menu};
+        if(p.id==Id::DesktopEditor){if(IsWindow(owner)){
+#ifdef ISLAND_INTERNAL_SETTINGS
+            wchar_t cls[64]={};GetClassNameW(owner,cls,64);if(!wcscmp(cls,L"OwnIsland.Surface"))PostMessageW(owner,WM_APP+11,0,0);else
+#endif
+            ShowWindow(owner,SW_MINIMIZE);
+        }view.beginArrange();view.pulse(true);return true;}
+        if(p.id==Id::DesktopPhoto||p.id==Id::DesktopVideo){impl->media.choose(owner,p.id==Id::DesktopVideo);view.awaitingLocalWallpaper=true;view.localWallpaperError=false;}
+        else if(p.id==Id::DesktopClear){impl->media.clear();impl->photo=false;WritePrivateProfileStringW(L"desktop",L"wallpaper-photo",L"0",impl->ini.c_str());}
+        else if(p.id==Id::DesktopEngine||p.id==Id::DesktopEngineCurrent)view.engineWallpaper.choose(owner,p.id==Id::DesktopEngineCurrent);
+        else if(p.id==Id::DesktopEngineOff)view.engineWallpaper.disable();
+        else if(p.id==Id::ClockStyle){int style=p.value>=1&&p.value<=9&&std::floor(p.value)==p.value?(int)p.value-1:-1;if(style>=0){impl->clockStyle=style;WritePrivateProfileStringW(L"desktop",L"clock-style",std::to_wstring(style).c_str(),impl->ini.c_str());}}
+        else {view.menu=false;return false;}
+        view.menu=false;
+    }else{
+        if(p.id==Id::ClockShadow){if(view.arranging)return false;view.layout[Impl::View::Clock].shadow=p.value!=0;view.saveLayout();}
+        else if(p.id==Id::DesktopBackdrop){view.engineWallpaper.disable();impl->selectPreset((int)p.value);}
+        else if(p.id==Id::DesktopFit){impl->placement=(int)p.value;impl->saveAppearance();}
+        else if(p.id==Id::DesktopShade){impl->shade=(int)std::lround(p.value);impl->saveAppearance();}
+        else return false;
+    }
+    for(auto& v:impl->views)v->draw();return true;
+}
 void Desktop::refreshFiles(){if(impl)impl->refresh();}
+bool desktopSelfTest(){
+    if(!widgetImageSelfTest())return false;auto rotated=rotateWidgetPoint({10,20},{0,0,100,100},90);auto original=rotateWidgetPoint(rotated,{0,0,100,100},-90);if(std::abs(original.x-10)>.001f||std::abs(original.y-20)>.001f)return false;auto constrained=constrainWidget({-50,20,800,300},45,1728,972);auto extent=rotatedWidgetBounds(constrained,45);if(extent.x<11.99f||extent.y<41.99f||extent.x+extent.w>1716.01f||extent.y+extent.h>960.01f)return false;
+
+    Desktop::Impl impl;Desktop::Impl::View view(&impl);view.resetLayout();view.width=1728;view.height=972;view.left=64;view.top=70;
+    view.layout[Desktop::Impl::View::Clock].w=532.5f;view.layout[Desktop::Impl::View::Clock].h=160;
+    auto box=view.contentBox(Desktop::Impl::View::Clock,{0,95,1065,320});if(std::abs(box.w-532.5f)>.01f||std::abs(box.h-160)>.01f)return false;
+    view.layout[Desktop::Impl::View::Apps].vertical=true;auto dock=view.baseBounds(Desktop::Impl::View::Apps);if(dock.w!=92||dock.h<250)return false;
+    wchar_t temp[MAX_PATH]={};if(!GetTempPathW(MAX_PATH,temp))return false;impl.ini=std::wstring(temp)+L"OwnIsland-layout-test-"+std::to_wstring(GetCurrentProcessId())+L".ini";
+    view.loadLayout();if(view.eqFPS!=60)return false;view.eqFPS=20;view.saveEQ();{Desktop::Impl::View explicitLimit(&impl);explicitLimit.loadLayout();if(explicitLimit.eqFPS!=20)return false;}view.eqFPS=60;view.saveEQ();view.layout[3]={48,64,true,540,160,false,true,false,.75f,45,2,1,0};view.layout[4].vertical=true;std::swap(view.order[0],view.order[13]);view.saveLayout();Desktop::Impl::View restored(&impl);restored.loadLayout();bool persistence=restored.layout[3].w==540&&restored.layout[3].h==160&&restored.layout[3].shadow&&std::abs(restored.layout[3].opacity-.75f)<.001f&&restored.layout[4].vertical&&restored.order[0]==13&&restored.layout[3].angle==45&&restored.layout[3].captionAlign==2&&restored.layout[3].skin==1;DeleteFileW(impl.ini.c_str());if(!persistence)return false;
+    // A visible panel owns its whole footprint, including gaps between controls.
+    Desktop::Impl::View overlay(&impl);overlay.resetLayout();for(auto& p:overlay.layout)p.shown=false;
+    for(bool equalizer:{false,true}){overlay.appearance=!equalizer;overlay.eqSettings=equalizer;auto area=equalizer?overlay.equalizerBounds():overlay.appearanceBounds();auto& apps=overlay.layout[Desktop::Impl::View::Apps];apps.shown=true;auto base=overlay.baseBounds(Desktop::Impl::View::Apps);apps.x=area.x-overlay.left-base.x;apps.y=area.y-overlay.top-base.y;apps.w=area.w;apps.h=area.h;
+        Box button{area.x+20,area.y+100,80,30};float x=button.x+10,y=button.y+10;overlay.hits={};overlay.hits.push_back({button,[]{},1,0,L"",Desktop::Impl::View::Apps});
+        if(overlay.hitAt(x,y)!=-1||!overlay.overlayAt(x,y))return false;overlay.hits.push_back({button,[]{},0,-1,L"",-2});if(overlay.hitAt(x,y)!=1)return false;
+        overlay.hits.pop_back();overlay.appearance=overlay.eqSettings=false;if(overlay.hitAt(x,y)!=0||overlay.overlayAt(x,y))return false;
+    }
+    auto fill=fitPicture({0,0,1920,1080},1000,2000,0),fit=fitPicture({0,0,1920,1080},1000,2000,1);return monthDays(2024,2)==29&&monthDays(2026,2)==28&&monthDays(2100,2)==28&&monthDays(2000,2)==29&&formattedTime(83)==L"1:23"&&formattedTime(3723)==L"1:02:03"&&std::abs(fill.source.y-718.75f)<.01f&&fill.source.h==562.5f&&fit.destination.w==540&&fit.destination.x==690;}

@@ -9,3 +9,5 @@ bool nativeDesktopTakeover(HWND host);
 void nativeDesktopRelease();
 // Also called by the independent shell watchdog after the main process exits.
 void nativeDesktopRecover(const std::wstring& recoveryFile);
+std::string nativeDesktopDiagnostics();
+bool nativeDesktopSelfTest();

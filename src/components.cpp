@@ -40,6 +40,11 @@ struct Lock {
     Lock(HANDLE h,DWORD wait=0):mutex(h){if(h){auto r=WaitForSingleObject(h,wait);held=r==WAIT_OBJECT_0||r==WAIT_ABANDONED;}}
     ~Lock(){if(held)ReleaseMutex(mutex);}
 };
+void publishState(Shared& s,const std::vector<unsigned char>& bytes){
+    if(bytes.size()>StateCapacity)throw std::runtime_error("state limit");
+    if(s.stateSize==bytes.size()&&!memcmp(s.state,bytes.data(),bytes.size()))return;
+    memcpy(s.state,bytes.data(),bytes.size());s.stateSize=(DWORD)bytes.size();++s.stateRevision;
+}
 struct Writer {
     std::vector<unsigned char> bytes;
     template<class T> void pod(const T& x){static_assert(std::is_trivially_copyable_v<T>);raw(&x,sizeof(x));}
@@ -105,7 +110,7 @@ struct FileHost {
 };
 struct DesktopHost {
     Channel channel;Desktop desktop;AudioMeter audio;DesktopData data;
-    HANDLE parent=nullptr;HWND hwnd=nullptr;DWORD stateRevision=0,taskRevision=0,coverRevision=0;ULONGLONG lastMaintain=0;bool stopping=false;
+    HANDLE parent=nullptr;HWND hwnd=nullptr;DWORD stateRevision=0,taskRevision=0,coverRevision=0;ULONGLONG lastMaintain=0;int bridgeInterval=16;bool stopping=false,settingsPending=false;
     std::shared_ptr<const TaskSnapshot> tasks;std::shared_ptr<const std::vector<unsigned char>> cover;
     ~DesktopHost(){if(parent)CloseHandle(parent);}
     void read(){
@@ -126,12 +131,14 @@ struct DesktopHost {
     }
     static LRESULT CALLBACK proc(HWND w,UINT m,WPARAM a,LPARAM b){
         auto self=(DesktopHost*)GetWindowLongPtrW(w,GWLP_USERDATA);if(m==WM_NCCREATE){self=(DesktopHost*)((CREATESTRUCTW*)b)->lpCreateParams;SetWindowLongPtrW(w,GWLP_USERDATA,(LONG_PTR)self);}if(!self)return DefWindowProcW(w,m,a,b);
-        if(m==WM_TIMER){if(self->stopping||self->channel.data->protocol!=Protocol||WaitForSingleObject(self->parent,0)!=WAIT_TIMEOUT){self->stopping=true;if((health::shared&&health::read(health::shared->gate)>0)||GetCapture()||!IsWindowEnabled(w))return 0;DestroyWindow(w);return 0;}self->read();auto now=GetTickCount64();if(now-self->lastMaintain>=250){self->desktop.maintain();self->lastMaintain=now;}Lock lock(self->channel.mutex);if(lock.held){self->channel.data->audioNeeded=self->desktop.needsAudio();self->channel.data->analysisFPS=self->desktop.analysisRate();}return 0;}
+        if(m==WM_COPYDATA){auto cd=(COPYDATASTRUCT*)b;if(!cd||cd->dwData!=island_settings::PacketTag||!cd->lpData||cd->cbData!=sizeof(island_settings::Packet)||a!=self->channel.data->owner||self->stopping||self->settingsPending)return FALSE;island_settings::Packet packet;memcpy(&packet,cd->lpData,sizeof(packet));if(!island_settings::valid(packet))return FALSE;if(packet.action){auto p=new(std::nothrow) island_settings::Packet(packet);if(!p)return FALSE;self->settingsPending=true;SetPropW((HWND)self->channel.data->owner,L"OwnIsland.DesktopSettingsBusy",(HANDLE)1);if(!PostMessageW(w,island_settings::QueuedAction,0,(LPARAM)p)){self->settingsPending=false;RemovePropW((HWND)self->channel.data->owner,L"OwnIsland.DesktopSettingsBusy");delete p;return FALSE;}return TRUE;}health::Hold protection;return protection&&self->desktop.setting(packet);}
+        if(m==island_settings::QueuedAction){std::unique_ptr<island_settings::Packet> packet((island_settings::Packet*)b);health::Hold protection;try{if(protection&&packet)self->desktop.setting(*packet);}catch(...){}self->settingsPending=false;RemovePropW((HWND)self->channel.data->owner,L"OwnIsland.DesktopSettingsBusy");return 0;}
+        if(m==WM_TIMER){if(self->stopping||self->channel.data->protocol!=Protocol||WaitForSingleObject(self->parent,0)!=WAIT_TIMEOUT){self->stopping=true;if((health::shared&&health::read(health::shared->gate)>0)||GetCapture()||!IsWindowEnabled(w))return 0;DestroyWindow(w);return 0;}self->read();auto now=GetTickCount64();if(now-self->lastMaintain>=250){self->desktop.maintain();self->lastMaintain=now;}Lock lock(self->channel.mutex);if(lock.held){self->channel.data->audioNeeded=self->desktop.needsAudio();self->channel.data->analysisFPS=self->desktop.analysisRate();}int interval=!self->data.awake?250:!GetPropW(w,L"OwnIsland.DesktopReady")?16:self->desktop.needsAudio()?std::clamp(1000/std::min(self->data.performance.analysisFPS,self->desktop.analysisRate()),16,200):100;if(interval!=self->bridgeInterval){self->bridgeInterval=interval;SetTimer(w,1,interval,nullptr);}return 0;}
         if(m==HostCommand){if(a==1)self->desktop.reveal();if(a==2)self->desktop.appearance();if(a==3)self->desktop.displayChanged();if(a==4)self->desktop.refreshFiles();return 0;}
         if(m==WM_APP+13){self->desktop.maintain();return 0;}
         if(m==WM_DISPLAYCHANGE||m==WM_DPICHANGED){self->desktop.displayChanged();return 0;}
         if(m==WM_APP+5)return 0;
-        if(m==WM_CLOSE){self->stopping=true;return 0;}
+        if(m==WM_CLOSE){if(!self->settingsPending)self->stopping=true;return 0;}
         if(m==WM_DESTROY){self->desktop.stop();KillTimer(w,1);PostQuitMessage(0);return 0;}
         return DefWindowProcW(w,m,a,b);
     }
@@ -146,7 +153,7 @@ struct DesktopProcess::Impl {
     ~Impl(){if(child.hProcess)CloseHandle(child.hProcess);}
     void publish(){
         if(!channel.data)return;try{auto d=snapshot();auto state=statePacket(d);bool tasksChanged=d.tasks!=lastTasks,coverChanged=d.media.cover!=lastCover;Writer tasks;if(tasksChanged)tasks=taskPacket(d.tasks);if(state.bytes.size()>StateCapacity||tasks.bytes.size()>TaskCapacity||(d.media.cover&&d.media.cover->size()>CoverCapacity))return;
-            Lock lock(channel.mutex);if(!lock.held)return;auto& s=*channel.data;memcpy(s.state,state.bytes.data(),state.bytes.size());s.stateSize=(DWORD)state.bytes.size();++s.stateRevision;
+            Lock lock(channel.mutex);if(!lock.held)return;auto& s=*channel.data;publishState(s,state.bytes);
             if(tasksChanged){memcpy(s.tasks,tasks.bytes.data(),tasks.bytes.size());s.taskSize=(DWORD)tasks.bytes.size();++s.taskRevision;lastTasks=d.tasks;}
             if(coverChanged||!s.coverRevision){s.coverSize=d.media.cover?(DWORD)d.media.cover->size():0;if(s.coverSize)memcpy(s.cover,d.media.cover->data(),s.coverSize);++s.coverRevision;lastCover=d.media.cover;}
         }catch(...){}
@@ -181,7 +188,9 @@ bool DesktopProcess::needsAudio()const{return impl&&impl->needAudio;}
 int DesktopProcess::analysisRate()const{return impl?impl->fps:5;}
 void DesktopProcess::refreshFiles(){if(impl)impl->command(4);}
 void DesktopProcess::appearance(){if(impl)impl->command(2);}
+bool DesktopProcess::setting(const island_settings::Packet& packet){if(!impl||!IsWindow(impl->host))return false;COPYDATASTRUCT cd{island_settings::PacketTag,sizeof(packet),(void*)&packet};DWORD_PTR result{};return SendMessageTimeoutW(impl->host,WM_COPYDATA,(WPARAM)impl->owner,(LPARAM)&cd,SMTO_ABORTIFHUNG|SMTO_BLOCK,5000,&result)&&result==1;}
 DWORD DesktopProcess::processId()const{return impl?impl->child.dwProcessId:0;}
+bool DesktopProcess::ready()const{if(!impl||!impl->channel.data)return false;Lock lock(impl->channel.mutex);if(!lock.held)return false;DWORD pid=0;GetWindowThreadProcessId(impl->host,&pid);return pid==impl->child.dwProcessId&&IsWindow(impl->host)&&GetTickCount64()-impl->channel.data->heartbeat<2000&&GetPropW(impl->host,L"OwnIsland.DesktopReady");}
 
 bool receiveComponentAction(HWND sender,const COPYDATASTRUCT* cd,std::unique_ptr<ComponentAction>& action){
     if(!cd||cd->dwData!=ActionPacket||!cd->lpData||cd->cbData>270000)return false;HWND panel=FindWindowW(L"OwnIsland.Surface",nullptr);DWORD pid=0;GetWindowThreadProcessId(sender,&pid);if(!pid||pid!=(DWORD)(UINT_PTR)GetPropW(panel,L"OwnIsland.DesktopProcess"))return false;
@@ -213,5 +222,8 @@ int runFilesComponent(const std::wstring& path,bool select,bool fresh){
     health::initialize();FileHost host;fileBrowserColors(host.palette);WNDCLASSEXW cls{sizeof(cls)};cls.lpfnWndProc=FileHost::proc;cls.hInstance=GetModuleHandleW(nullptr);cls.lpszClassName=clsName.c_str();RegisterClassExW(&cls);HWND window=CreateWindowExW(WS_EX_TOOLWINDOW,cls.lpszClassName,L"",WS_POPUP,0,0,1,1,nullptr,nullptr,cls.hInstance,&host);int result=22;
     if(window){SetPropW(window,L"OwnIsland.Files.Process",(HANDLE)(UINT_PTR)GetCurrentProcessId());health::ready(window);if(openFileBrowser(path,select,fresh)){SetTimer(window,1,250,nullptr);MSG msg;while(GetMessageW(&msg,nullptr,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);}result=0;}else DestroyWindow(window);}ReleaseMutex(mutex);CloseHandle(mutex);return result;
 }
-
-
+bool componentSelfTest(){auto test=std::make_unique<Shared>();std::vector<unsigned char> bytes{1,2,3};publishState(*test,bytes);auto revision=test->stateRevision;publishState(*test,bytes);if(test->stateRevision!=revision)return false;bytes[2]=4;publishState(*test,bytes);if(test->stateRevision!=revision+1||test->state[2]!=4)return false;
+    try{DesktopData d;d.note=L"Заметка Ω";d.pinned={L"C:\\тест\\приложение.lnk"};d.weather.days.push_back({L"2026-11-05",-3,5,2});d.media.title=L"Музыка";d.timerSeconds=123;auto state=statePacket(d);Reader r{state.bytes.data(),state.bytes.size()};auto copy=statePacket(r);if(r.n||copy.note!=d.note||copy.pinned!=d.pinned||copy.media.title!=d.media.title||copy.timerSeconds!=123||copy.weather.days.size()!=1)return false;auto tasks=std::make_shared<TaskSnapshot>();TaskGroup group;group.key=L"test";group.windows.push_back({(HWND)123,456,L"Окно"});tasks->groups.push_back(group);auto packet=taskPacket(tasks);Reader q{packet.bytes.data(),packet.bytes.size()};auto restored=taskPacket(q);if(q.n||restored->groups.size()!=1||restored->groups[0].windows[0].pid!=456)return false;
+        bool rejected=false;try{Reader bad{state.bytes.data(),3};statePacket(bad);}catch(...){rejected=true;}return rejected&&quote(L"C:\\folder\\")==L"\"C:\\folder\\\\\"";
+    }catch(...){return false;}
+}

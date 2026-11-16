@@ -105,6 +105,7 @@ public:
     void fill(Box r,unsigned color,float radius=0,float opacity=1,bool outlined=true);
     void stroke(Box r, unsigned color, float radius = 0, float width = 1);
     void line(float x, float y, float x2, float y2, unsigned color, float width = 1);
+    void polygon(std::initializer_list<D2D1_POINT_2F> points,unsigned color,float opacity=1);
     void text(const std::wstring& value, Box r, float size = 13, unsigned color = 0xeeeeef,
               bool bold = false, DWRITE_TEXT_ALIGNMENT align = DWRITE_TEXT_ALIGNMENT_LEADING,
               bool wrap = false, const wchar_t* family = L"Segoe UI",
